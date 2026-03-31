@@ -1,18 +1,20 @@
 # Code Analyze MVP
 
-MVP для анализа кода на Java/C#:
+MVP для анализа кода на Java/C#/Python:
 - Rust CLI строит полный AST по каждому файлу.
 - Rust CLI использует параллельный разбор файлов (`max_workers` = доступные CPU).
 - FastAPI backend запускает Rust-анализатор и возвращает JSON.
 - Frontend позволяет выбрать sample-проект или загрузить папку (directory upload) и визуализирует AST (граф + дерево).
+- Добавлен Source Viewer (как в IDE): полный текст файла, номера строк, подсветка релевантных строк по выбранному узлу/trace.
 
 ## Структура
 
-- `rust-analyzer/` - Rust-парсер (`tree-sitter` для Java/C#)
+- `rust-analyzer/` - Rust-парсер (`tree-sitter` для Java/C#/Python)
 - `backend/` - FastAPI API
 - `static/` - HTML/JS UI
 - `samples/java_demo` - тестовый Java проект
 - `samples/csharp_demo` - тестовый C# проект
+- `samples/python_demo` - тестовый Python проект
 
 ## Запуск
 
@@ -49,6 +51,7 @@ JSON:
 - `max_workers`
 - `files[]`
   - `path`
-  - `language` (`java` / `csharp`)
+  - `language` (`java` / `csharp` / `python`)
   - `ast` (полное дерево)
   - `calls[]` (обнаруженные вызовы с контекстом)
+  - `source_text` (исходный код файла для Source Viewer)

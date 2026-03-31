@@ -12,7 +12,7 @@ use tree_sitter::{Node, Parser, Point, TreeCursor};
 use walkdir::WalkDir;
 
 #[derive(ClapParser, Debug)]
-#[command(author, version, about = "Build full AST with semantic graph for Java/C# projects")]
+#[command(author, version, about = "Build full AST with semantic graph for Java/C#/Python projects")]
 struct Cli {
     /// Path to project directory
     project_dir: PathBuf,
@@ -38,6 +38,7 @@ struct AstProject {
 struct AstFile {
     path: String,
     language: LanguageKind,
+    source_text: String,
     ast: AstNode,
     calls: Vec<CallSite>,
     semantic: FileSemantic,
@@ -141,6 +142,7 @@ struct ProjectSemantic {
 struct ParsedFileRaw {
     path: String,
     language: LanguageKind,
+    source_text: String,
     ast: AstNode,
     calls: Vec<CallSite>,
     symbols: Vec<Symbol>,
@@ -162,6 +164,7 @@ struct CallCandidate {
 enum LanguageKind {
     Java,
     Csharp,
+    Python,
 }
 
 impl LanguageKind {
@@ -169,6 +172,7 @@ impl LanguageKind {
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("java") => Some(Self::Java),
             Some("cs") => Some(Self::Csharp),
+            Some("py") => Some(Self::Python),
             _ => None,
         }
     }
@@ -177,6 +181,7 @@ impl LanguageKind {
         match self {
             LanguageKind::Java => tree_sitter_java::language(),
             LanguageKind::Csharp => tree_sitter_c_sharp::language(),
+            LanguageKind::Python => tree_sitter_python::language(),
         }
     }
 }
@@ -305,6 +310,7 @@ fn analyze_project(project_dir: &Path, max_workers_override: Option<usize>) -> R
         files.push(AstFile {
             path: raw.path,
             language: raw.language,
+            source_text: raw.source_text,
             ast: raw.ast,
             calls: raw.calls,
             semantic: FileSemantic {
@@ -357,6 +363,7 @@ fn parse_file(path: &Path, language: LanguageKind, project_dir: &Path) -> Result
     Ok(ParsedFileRaw {
         path: rel_path,
         language,
+        source_text: source,
         ast,
         calls,
         symbols,
@@ -513,7 +520,7 @@ fn walk_for_calls(
 
     if matches!(
         node_kind,
-        "method_invocation" | "invocation_expression" | "object_creation_expression"
+        "method_invocation" | "invocation_expression" | "object_creation_expression" | "call"
     ) {
         let callee_snippet = node
             .utf8_text(source)
@@ -600,7 +607,14 @@ fn walk_semantic(
     dependencies: &mut Vec<String>,
 ) {
     let kind = node.kind();
-    if matches!(kind, "import_declaration" | "using_directive" | "package_declaration") {
+    if matches!(
+        kind,
+        "import_declaration"
+            | "using_directive"
+            | "package_declaration"
+            | "import_statement"
+            | "import_from_statement"
+    ) {
         if let Ok(text) = node.utf8_text(source) {
             let dep = text.trim().replace('\n', " ");
             if !dep.is_empty() {
@@ -655,12 +669,25 @@ fn detect_decl_symbol(
 ) -> Option<Symbol> {
     let (kind, name) = match node.kind() {
         "class_declaration" => (SymbolKind::Class, extract_decl_name(node, source)?),
+        "class_definition" => (SymbolKind::Class, extract_decl_name(node, source)?),
         "method_declaration" | "local_function_statement" => {
             (SymbolKind::Method, extract_decl_name(node, source)?)
         }
+        "function_definition" => {
+            let name = extract_decl_name(node, source)?;
+            if name == "__init__" {
+                (SymbolKind::Constructor, name)
+            } else {
+                (SymbolKind::Method, name)
+            }
+        }
         "constructor_declaration" => (SymbolKind::Constructor, extract_decl_name(node, source)?),
-        "parameter" => (SymbolKind::Parameter, extract_decl_name(node, source)?),
-        "variable_declarator" => (SymbolKind::Variable, extract_decl_name(node, source)?),
+        "parameter" | "typed_parameter" | "default_parameter" => {
+            (SymbolKind::Parameter, extract_decl_name(node, source)?)
+        }
+        "variable_declarator" | "assignment" => {
+            (SymbolKind::Variable, extract_decl_name(node, source)?)
+        }
         _ => return None,
     };
 
@@ -736,6 +763,13 @@ fn extract_call_name(node: Node<'_>, source: &[u8]) -> Option<String> {
             }
         }
     }
+    if let Some(function_node) = node.child_by_field_name("function") {
+        if let Ok(text) = function_node.utf8_text(source) {
+            if let Some(name) = extract_name_from_snippet(text.trim()) {
+                return Some(name);
+            }
+        }
+    }
     first_identifier_text(node, source)
 }
 
@@ -764,7 +798,9 @@ fn extract_name_from_snippet(snippet: &str) -> Option<String> {
 fn extract_context_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     match node.kind() {
         "class_declaration"
+        | "class_definition"
         | "method_declaration"
+        | "function_definition"
         | "constructor_declaration"
         | "local_function_statement" => node
             .child_by_field_name("name")

@@ -91,6 +91,43 @@
       max-height: 45vh;
       padding: 8px;
     }
+    .sourceWrap {
+      border: 1px solid #334155;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 52vh;
+      background: #0b1220;
+      padding: 0;
+      font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+      font-size: 12px;
+    }
+    .sourceLine {
+      display: grid;
+      grid-template-columns: 56px 1fr;
+      gap: 10px;
+      padding: 0 10px;
+      min-height: 20px;
+      align-items: center;
+      white-space: pre;
+    }
+    .sourceLine:hover {
+      background: rgba(51, 65, 85, 0.35);
+    }
+    .sourceLineNo {
+      color: #64748b;
+      text-align: right;
+      user-select: none;
+      border-right: 1px solid #334155;
+      padding-right: 8px;
+    }
+    .sourceLineCode {
+      color: #e2e8f0;
+      white-space: pre;
+      overflow-wrap: normal;
+    }
+    .sourceLineHighlight {
+      background: rgba(245, 158, 11, 0.18);
+    }
     .controlRow {
       display: flex;
       align-items: center;
@@ -166,6 +203,32 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .childrenList {
+      margin-top: 10px;
+      max-height: 180px;
+      overflow: auto;
+      border-top: 1px solid #334155;
+      padding-top: 8px;
+    }
+    .childRow {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+    .childBtn {
+      background: #0f172a;
+      border: 1px solid #334155;
+      color: #93c5fd;
+      border-radius: 6px;
+      padding: 4px 8px;
+      cursor: pointer;
+      font-size: 11px;
+      margin: 0;
+    }
     .traceRow {
       display: flex;
       gap: 8px;
@@ -199,7 +262,7 @@
 <body>
   <div class="container">
     <h1>Code Analyze: Full AST</h1>
-    <p class="muted">Rust parser (Java/C#) + FastAPI backend + AST visualization.</p>
+    <p class="muted">Rust parser (Java/C#/Python) + FastAPI backend + AST visualization.</p>
 
     <div class="card">
       <h3>Analyze sample project</h3>
@@ -211,7 +274,7 @@
       <h3>Analyze your local project folder</h3>
       <input id="folderInput" type="file" webkitdirectory directory multiple />
       <button id="analyzeUploadBtn">Analyze selected folder</button>
-      <p class="muted">Supports Java (.java) and C# (.cs).</p>
+      <p class="muted">Supports Java (.java), C# (.cs), Python (.py).</p>
     </div>
 
     <div class="card">
@@ -256,11 +319,7 @@
       details.open = false;
       const summary = document.createElement("summary");
 
-      let title = node.kind;
-      if (node.text) {
-        title += ` :: ${node.text.replace(/\s+/g, " ").slice(0, 80)}`;
-      }
-      summary.textContent = title;
+      summary.textContent = friendlyAstLabel(node);
       details.appendChild(summary);
 
       if (node.children && node.children.length) {
@@ -277,6 +336,83 @@
         el.setAttribute(k, String(v));
       }
       return el;
+    }
+
+    function humanizeKind(kind) {
+      const normalized = (kind || "")
+        .replace(/_/g, " ")
+        .replace(/\bdeclaration\b/g, "")
+        .replace(/\bdefinition\b/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!normalized) return "Node";
+      return normalized
+        .split(" ")
+        .map((p) => p ? p[0].toUpperCase() + p.slice(1) : p)
+        .join(" ");
+    }
+
+    function extractNameFromSnippet(snippet) {
+      const beforeParen = String(snippet || "").split("(")[0];
+      const matches = beforeParen.match(/[A-Za-z_][A-Za-z0-9_]*/g);
+      if (!matches || !matches.length) return "";
+      return matches[matches.length - 1];
+    }
+
+    function findNamedToken(node) {
+      const text = (node && node.text) ? node.text : "";
+      if (!text) return "";
+      const kind = (node.kind || "").toLowerCase();
+      if (kind.includes("class")) {
+        const m = text.match(/\bclass\s+([A-Za-z_][A-Za-z0-9_]*)/);
+        if (m) return m[1];
+      }
+      if (kind.includes("function") || kind.includes("method") || kind.includes("constructor")) {
+        const mPy = text.match(/\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+        if (mPy) return mPy[1];
+        const mGeneric = text.match(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+        if (mGeneric) return mGeneric[1];
+      }
+      if (kind.includes("variable") || kind.includes("parameter") || kind.includes("assignment")) {
+        const leftPart = text.split("=")[0];
+        const ids = leftPart.match(/[A-Za-z_][A-Za-z0-9_]*/g);
+        if (ids && ids.length) return ids[ids.length - 1];
+      }
+      if (kind.includes("call") || kind.includes("invocation")) {
+        return extractNameFromSnippet(text);
+      }
+      return "";
+    }
+
+    function friendlyAstLabel(node) {
+      const kind = (node && node.kind) ? node.kind : "";
+      const lower = kind.toLowerCase();
+      const name = findNamedToken(node);
+      if (lower.includes("class")) return `Class ${name || "(anonymous)"}`;
+      if (lower.includes("constructor")) return `Constructor ${name || ""}`.trim();
+      if (lower.includes("method") || lower.includes("function")) return `Method ${name || "(anonymous)"}`;
+      if (lower.includes("call") || lower.includes("invocation")) return `Call ${name || "(unknown)"}`;
+      if (lower.includes("variable") || lower.includes("assignment")) return `Variable ${name || "(unnamed)"}`;
+      if (lower.includes("parameter")) return `Parameter ${name || "(unnamed)"}`;
+      if (lower.includes("import") || lower.includes("using") || lower.includes("package")) return "Dependency";
+      if (lower.includes("dictionary")) return "Dictionary literal";
+      if (lower === "pair") return "Key-value pair";
+      if (lower.includes("list")) return "List literal";
+      if (lower.includes("set")) return "Set literal";
+      if (lower.includes("tuple")) return "Tuple literal";
+      const base = humanizeKind(kind);
+      const snippet = (node && node.text) ? node.text.replace(/\s+/g, " ").slice(0, 34) : "";
+      const meaningfulSnippet = /[A-Za-z0-9_]/.test(snippet) ? snippet : "";
+      return meaningfulSnippet ? `${base}: ${meaningfulSnippet}` : base;
+    }
+
+    function countAstNodes(node) {
+      if (!node) return 0;
+      let total = 1;
+      for (const child of node.children || []) {
+        total += countAstNodes(child);
+      }
+      return total;
     }
 
     function buildGraphData(root, maxNodes = 900) {
@@ -432,15 +568,19 @@
 
       const scopeKinds = new Set([
         "program",
+        "module",
         "namespace_declaration",
         "class_declaration",
+        "class_definition",
         "method_declaration",
+        "function_definition",
         "constructor_declaration",
         "local_function_statement",
         "block",
       ]);
       const methodKinds = new Set([
         "method_declaration",
+        "function_definition",
         "constructor_declaration",
         "local_function_statement",
       ]);
@@ -448,8 +588,16 @@
         "import_declaration",
         "using_directive",
         "package_declaration",
+        "import_statement",
+        "import_from_statement",
       ]);
-      const variableKinds = new Set(["variable_declarator", "parameter"]);
+      const variableKinds = new Set([
+        "variable_declarator",
+        "parameter",
+        "typed_parameter",
+        "default_parameter",
+        "assignment",
+      ]);
 
       function walk(node, scopeStack = []) {
         const kind = node.kind;
@@ -472,7 +620,7 @@
         }
 
         const currentScope = scopeStack[scopeStack.length - 1];
-        if (kind === "class_declaration") {
+        if (kind === "class_declaration" || kind === "class_definition") {
           const className = getFirstIdentifier(node) || "anonymous_class";
           declarations.classes.push({ name: className, kind, node });
           if (currentScope) currentScope.classes.push(className);
@@ -524,7 +672,8 @@
       const uniq = (arr) => Array.from(new Set(arr)).slice(0, 80);
 
       const lines = [];
-      lines.push(`Node: ${nodeRef.kind}`);
+      lines.push(`Node: ${friendlyAstLabel(nodeRef)}`);
+      lines.push(`Kind: ${nodeRef.kind}`);
       if (nodeRef.text) lines.push(`Text: ${nodeRef.text.replace(/\s+/g, " ").slice(0, 160)}`);
       lines.push(`Position: ${nodeRef.start_position.row}:${nodeRef.start_position.column}`);
       lines.push("");
@@ -545,56 +694,78 @@
       const matches = [];
       const relatedCalls = [];
       const relatedDependencies = [];
+      const symbolKindOf = (symbol) => String(symbol.kind || "").toLowerCase();
+      const isClassSymbol = (symbol) => symbolKindOf(symbol) === "class";
+      const isMethodSymbol = (symbol) => ["method", "constructor"].includes(symbolKindOf(symbol));
+      const isVariableSymbol = (symbol) => ["variable", "parameter"].includes(symbolKindOf(symbol));
 
       for (const file of projectAst.files || []) {
-        const indexData = collectNodeIndex(file.ast);
         const filePath = file.path;
+        const semantic = file.semantic || {};
+        const symbols = semantic.symbols || [];
+        const calls = semantic.resolved_calls || [];
+        const deps = semantic.dependencies || [];
+        const source = String(file.source_text || "");
 
         if (queryType === "class") {
-          for (const c of indexData.declarations.classes) {
-            if (c.name.toLowerCase().includes(q)) {
-              matches.push(`[class] ${c.name} @ ${filePath}`);
+          for (const s of symbols) {
+            if (isClassSymbol(s) && String(s.name || "").toLowerCase().includes(q)) {
+              const row = s.range && s.range.start ? s.range.start.row : "?";
+              matches.push(`[class] ${s.name} @ ${filePath}:${row}`);
             }
           }
         } else if (queryType === "method") {
-          for (const m of indexData.declarations.methods) {
-            if (m.name.toLowerCase().includes(q)) {
-              matches.push(`[method] ${m.name} @ ${filePath}`);
+          for (const s of symbols) {
+            if (isMethodSymbol(s) && String(s.name || "").toLowerCase().includes(q)) {
+              const row = s.range && s.range.start ? s.range.start.row : "?";
+              matches.push(`[method] ${s.name} @ ${filePath}:${row}`);
+            }
+          }
+          for (const c of calls) {
+            if (String(c.callee_name || "").toLowerCase().includes(q)) {
+              matches.push(`[call] ${c.callee_name} @ ${filePath}:${c.location ? c.location.row : "?"}`);
             }
           }
         } else if (queryType === "variable") {
-          for (const v of indexData.declarations.variables) {
-            if (v.name.toLowerCase().includes(q)) {
-              matches.push(`[variable] ${v.name} @ ${filePath}`);
+          for (const s of symbols) {
+            if (isVariableSymbol(s) && String(s.name || "").toLowerCase().includes(q)) {
+              const row = s.range && s.range.start ? s.range.start.row : "?";
+              matches.push(`[variable] ${s.name} @ ${filePath}:${row}`);
             }
           }
         } else if (queryType === "line") {
           const lineNum = Number.parseInt(q, 10);
           if (Number.isFinite(lineNum)) {
-            const scopesForLine = indexData.scopes.filter(
-              (s) => s.start.row <= lineNum && lineNum <= s.end.row
-            );
-            for (const s of scopesForLine.slice(0, 8)) {
-              matches.push(`[line] ${lineNum} in ${s.kind}(${s.name}) @ ${filePath}`);
+            for (const s of symbols) {
+              const start = s.range && s.range.start ? s.range.start.row : null;
+              const end = s.range && s.range.end ? s.range.end.row : null;
+              if (start !== null && end !== null && start <= lineNum && lineNum <= end) {
+                matches.push(`[line] ${lineNum} in ${s.kind}(${s.name}) @ ${filePath}`);
+              }
+            }
+            for (const c of calls) {
+              if (c.location && c.location.row === lineNum) {
+                matches.push(`[line] ${lineNum} call ${c.callee_name} @ ${filePath}`);
+              }
             }
           }
         } else {
-          const rootText = file.ast.text || "";
-          if (rootText.toLowerCase().includes(q)) {
-            matches.push(`[string] match in root snippet @ ${filePath}`);
+          if (source.toLowerCase().includes(q)) {
+            matches.push(`[string] match in source @ ${filePath}`);
           }
         }
 
-        for (const call of file.calls || []) {
-          const caller = (call.caller_context || "").toLowerCase();
-          const callee = (call.callee_snippet || "").toLowerCase();
+        for (const call of calls) {
+          const caller = String(call.caller_context || "").toLowerCase();
+          const callee = String(call.callee_name || "").toLowerCase();
           if (caller.includes(q) || callee.includes(q)) {
-            relatedCalls.push(`${filePath}: ${call.caller_context || "global"} -> ${call.callee_snippet}`);
+            const resolved = call.resolved_to ? ` => ${call.resolved_to}` : "";
+            relatedCalls.push(`${filePath}:${call.location ? call.location.row : "?"}: ${call.caller_context || "global"} -> ${call.callee_name}${resolved}`);
           }
         }
 
-        for (const dep of indexData.dependencies) {
-          if (dep.toLowerCase().includes(q)) {
+        for (const dep of deps) {
+          if (String(dep).toLowerCase().includes(q)) {
             relatedDependencies.push(`${filePath}: ${dep}`);
           }
         }
@@ -617,6 +788,146 @@
       lines.push(`Dependencies (${d.length}):`);
       lines.push(d.length ? d.join("\n") : "none");
       return lines.join("\n");
+    }
+
+    function collectMatchingAstRanges(root, queryType, queryValue, maxMatches = 120) {
+      const ranges = [];
+      const q = (queryValue || "").trim();
+      if (!q) return ranges;
+
+      function walk(node) {
+        if (!node || ranges.length >= maxMatches) return;
+        if (nodeMatchesTrace(node, queryType, q) && node.start_position && node.end_position) {
+          ranges.push({
+            start: node.start_position.row,
+            end: node.end_position.row,
+            kind: node.kind,
+            text: (node.text || "").slice(0, 100),
+          });
+        }
+        for (const child of node.children || []) {
+          walk(child);
+          if (ranges.length >= maxMatches) break;
+        }
+      }
+
+      walk(root);
+      return ranges;
+    }
+
+    function collectMatchingRangesForTrace(file, queryType, queryValue, maxMatches = 120) {
+      const q = (queryValue || "").trim().toLowerCase();
+      if (!q) return [];
+
+      const ranges = [];
+      const semantic = file && file.semantic ? file.semantic : {};
+      const symbols = semantic.symbols || [];
+      const calls = semantic.resolved_calls || [];
+      const kindOf = (s) => String(s.kind || "").toLowerCase();
+
+      if (queryType === "line") {
+        const lineNum = Number.parseInt(q, 10);
+        if (Number.isFinite(lineNum)) {
+          return [{ start: lineNum, end: lineNum }];
+        }
+      }
+
+      for (const s of symbols) {
+        const name = String(s.name || "").toLowerCase();
+        const kind = kindOf(s);
+        const matchClass = queryType === "class" && kind === "class" && name.includes(q);
+        const matchMethod = queryType === "method" && ["method", "constructor"].includes(kind) && name.includes(q);
+        const matchVariable = queryType === "variable" && ["variable", "parameter"].includes(kind) && name.includes(q);
+        const matchString = queryType === "string" && (
+          name.includes(q) || String(s.fq_name || "").toLowerCase().includes(q)
+        );
+        if (matchClass || matchMethod || matchVariable || matchString) {
+          if (s.range && s.range.start && s.range.end) {
+            ranges.push({ start: s.range.start.row, end: s.range.end.row });
+            if (ranges.length >= maxMatches) return ranges;
+          }
+        }
+      }
+
+      if (queryType === "method" || queryType === "string") {
+        for (const c of calls) {
+          const callee = String(c.callee_name || "").toLowerCase();
+          if (callee.includes(q) && c.location) {
+            ranges.push({ start: c.location.row, end: c.location.row });
+            if (ranges.length >= maxMatches) return ranges;
+          }
+        }
+      }
+
+      if (!ranges.length) {
+        return collectMatchingAstRanges(file.ast, queryType, queryValue, maxMatches);
+      }
+      return ranges;
+    }
+
+    function normalizeRanges(ranges, fallbackLine = 1) {
+      if (!ranges || !ranges.length) {
+        return [{ start: fallbackLine, end: fallbackLine }];
+      }
+      return ranges.map((r) => {
+        const s = Number(r.start) || fallbackLine;
+        const e = Number(r.end) || s;
+        return { start: Math.max(1, Math.min(s, e)), end: Math.max(1, Math.max(s, e)) };
+      });
+    }
+
+    function buildHighlightedLineSet(ranges) {
+      const highlighted = new Set();
+      for (const r of ranges) {
+        for (let line = r.start; line <= r.end; line += 1) {
+          highlighted.add(line);
+          if (highlighted.size > 10000) return highlighted;
+        }
+      }
+      return highlighted;
+    }
+
+    function renderSourceViewer(file, target, ranges, autoScroll = true) {
+      target.innerHTML = "";
+      const source = file && typeof file.source_text === "string" ? file.source_text : "";
+      const lines = source.split(/\r?\n/);
+      const normalizedRanges = normalizeRanges(ranges, 1);
+      const highlighted = buildHighlightedLineSet(normalizedRanges);
+
+      if (!lines.length) {
+        const empty = document.createElement("div");
+        empty.className = "panelBody";
+        empty.textContent = "No source text available for this file.";
+        target.appendChild(empty);
+        return;
+      }
+
+      let firstHighlightedEl = null;
+      for (let i = 0; i < lines.length; i += 1) {
+        const lineNo = i + 1;
+        const row = document.createElement("div");
+        row.className = highlighted.has(lineNo) ? "sourceLine sourceLineHighlight" : "sourceLine";
+
+        const no = document.createElement("span");
+        no.className = "sourceLineNo";
+        no.textContent = String(lineNo);
+
+        const code = document.createElement("span");
+        code.className = "sourceLineCode";
+        code.textContent = lines[i].length ? lines[i] : " ";
+
+        row.appendChild(no);
+        row.appendChild(code);
+        target.appendChild(row);
+
+        if (!firstHighlightedEl && highlighted.has(lineNo)) {
+          firstHighlightedEl = row;
+        }
+      }
+
+      if (autoScroll && firstHighlightedEl) {
+        firstHighlightedEl.scrollIntoView({ block: "center", inline: "nearest" });
+      }
     }
 
     function attachPanZoom(svg, viewport) {
@@ -695,6 +1006,7 @@
       if (!node) return "";
       const parent = node.parentId !== null && node.parentId !== undefined ? nodeById.get(node.parentId) : null;
       const lines = [];
+      lines.push(`title: ${friendlyAstLabel(node)}`);
       lines.push(`kind: ${node.kind}`);
       lines.push(`id: ${node.id}`);
       lines.push(`depth: ${node.depth}`);
@@ -750,19 +1062,23 @@
       if (!q) return false;
       const kind = (node.kind || "").toLowerCase();
       const text = (node.text || "").toLowerCase();
+      const name = findNamedToken(node).toLowerCase();
       if (queryType === "line") {
         const lineNum = Number.parseInt(q, 10);
         if (!Number.isFinite(lineNum) || !node.start_position || !node.end_position) return false;
         return node.start_position.row <= lineNum && lineNum <= node.end_position.row;
       }
       if (queryType === "class") {
-        return (kind.includes("class") || kind.includes("interface") || kind.includes("type")) && text.includes(q);
+        return (kind.includes("class") || kind.includes("interface") || kind.includes("type")) && name.includes(q);
       }
       if (queryType === "method") {
-        return (kind.includes("method") || kind.includes("function") || kind.includes("invocation")) && text.includes(q);
+        if (kind.includes("call") || kind.includes("invocation")) {
+          return name.includes(q);
+        }
+        return (kind.includes("method") || kind.includes("function") || kind.includes("constructor")) && name.includes(q);
       }
       if (queryType === "variable") {
-        return (kind.includes("variable") || kind.includes("identifier") || kind.includes("parameter") || kind.includes("field")) && text.includes(q);
+        return (kind.includes("variable") || kind.includes("parameter") || kind.includes("assignment") || kind.includes("field")) && name.includes(q);
       }
       return kind.includes(q) || text.includes(q);
     }
@@ -870,9 +1186,7 @@
           stroke: "#67e8f9",
           "stroke-width": 0.8,
         });
-        const label = node.text
-          ? `${node.kind} :: ${node.text.replace(/\s+/g, " ").slice(0, 42)}`
-          : node.kind;
+        const label = friendlyAstLabel(node);
         const labelPlacement = placeLabelNoOverlap(node.x, node.y, label, occupiedLabelBoxes, {
           fontSize: 11,
           baseDx: 8,
@@ -900,8 +1214,7 @@
         });
         g.addEventListener("click", (event) => {
           event.stopPropagation();
-          highlightPathToRoot(node.id);
-          if (onSelectNode) onSelectNode(node);
+          focusNodeById(node.id);
         });
         g.addEventListener("mouseenter", () => {
           tooltip.textContent = buildNodeTooltip(node, nodeById);
@@ -960,6 +1273,32 @@
           }
           currentId = currentNode.parentId;
         }
+      }
+
+      function toSelectionPayload(node) {
+        const childNodes = (node.children || [])
+          .map((childId) => nodeById.get(childId))
+          .filter(Boolean)
+          .map((child) => ({
+            node_id: child.id,
+            kind: child.kind,
+            label: friendlyAstLabel(child),
+            start_position: child.start_position,
+            end_position: child.end_position,
+          }));
+        return {
+          ...node,
+          node_id: node.id,
+          label: friendlyAstLabel(node),
+          child_nodes: childNodes,
+        };
+      }
+
+      function focusNodeById(nodeId) {
+        const node = nodeById.get(nodeId);
+        if (!node) return;
+        highlightPathToRoot(nodeId);
+        if (onSelectNode) onSelectNode(toSelectionPayload(node));
       }
 
       function highlightByTrace(queryType, queryValue, includeContext) {
@@ -1028,7 +1367,7 @@
       highlightPathToRoot(0);
       if (onSelectNode) {
         const root = nodeById.get(0);
-        if (root) onSelectNode(root);
+        if (root) onSelectNode(toSelectionPayload(root));
       }
 
       const note = document.createElement("div");
@@ -1045,6 +1384,7 @@
       return {
         highlightByTrace,
         highlightPathToRoot,
+        focusNodeById,
       };
     }
 
@@ -1075,10 +1415,12 @@
       for (const sym of allSymbols) {
         const id = `sym:${sym.id}`;
         ensureNode(id, {
-          label: sym.fq_name || sym.name,
+          label: `${humanizeKind(sym.kind)} ${sym.name}`.trim(),
           kind: "symbol",
           symbolKind: sym.kind,
           filePath: sym.file_path,
+          start_position: sym.range ? sym.range.start : null,
+          end_position: sym.range ? sym.range.end : null,
           details: [
             `symbol: ${sym.name}`,
             `fq: ${sym.fq_name}`,
@@ -1106,6 +1448,8 @@
         ensureNode(depId, {
           label: dep.slice(0, 80),
           kind: "dependency",
+          start_position: { row: 1, column: 1 },
+          end_position: { row: 1, column: 1 },
           details: `dependency: ${dep}\nfile: ${file.path}`,
         });
         edges.push({ from: fileRootId, to: depId, kind: "dependency" });
@@ -1123,8 +1467,10 @@
         if (!calleeId) {
           calleeId = `unresolved:${file.path}:${call.callee_name}:${call.location.row}:${call.location.column}`;
           ensureNode(calleeId, {
-            label: `unresolved ${call.callee_name}`,
+            label: `Unresolved call ${call.callee_name}`,
             kind: "unresolved",
+            start_position: { row: call.location.row, column: call.location.column },
+            end_position: { row: call.location.row, column: call.location.column },
             details: [
               `callee: ${call.callee_name}`,
               `resolved_to: ${call.resolved_to || "none"}`,
@@ -1338,21 +1684,7 @@
         });
         g.addEventListener("click", (event) => {
           event.stopPropagation();
-          if (onSelectNode) {
-            onSelectNode({
-              kind: `semantic:${node.kind}`,
-              text: node.label,
-              start_position: { row: 1, column: 1 },
-              end_position: { row: 1, column: 1 },
-            });
-          }
-          for (const [id, c] of nodeCircle.entries()) {
-            c.setAttribute("r", "5");
-            const t = nodeText.get(id);
-            if (t) t.setAttribute("fill", "#e2e8f0");
-          }
-          circle.setAttribute("r", "7");
-          text.setAttribute("fill", "#fde68a");
+          focusSemanticNode(node.id);
         });
       }
 
@@ -1383,6 +1715,43 @@
           e.line.setAttribute("opacity", "0.9");
           e.line.setAttribute("stroke-width", e.edge.kind === "unresolved_call" ? "1.9" : "1.4");
         }
+      }
+
+      function toSemanticSelectionPayload(node) {
+        const childNodes = (node.children || [])
+          .map((childId) => nodeById.get(childId))
+          .filter(Boolean)
+          .map((child) => ({
+            node_id: child.id,
+            kind: `semantic:${child.kind}`,
+            label: child.label || child.kind,
+            start_position: child.start_position || { row: 1, column: 1 },
+            end_position: child.end_position || child.start_position || { row: 1, column: 1 },
+          }));
+        return {
+          node_id: node.id,
+          kind: `semantic:${node.kind}`,
+          text: node.label,
+          label: node.label || node.kind,
+          start_position: node.start_position || { row: 1, column: 1 },
+          end_position: node.end_position || node.start_position || { row: 1, column: 1 },
+          child_nodes: childNodes,
+        };
+      }
+
+      function focusSemanticNode(nodeId) {
+        const node = nodeById.get(nodeId);
+        if (!node) return;
+        for (const [id, c] of nodeCircle.entries()) {
+          c.setAttribute("r", "5");
+          const t = nodeText.get(id);
+          if (t) t.setAttribute("fill", "#e2e8f0");
+        }
+        const c = nodeCircle.get(nodeId);
+        const t = nodeText.get(nodeId);
+        if (c) c.setAttribute("r", "7");
+        if (t) t.setAttribute("fill", "#fde68a");
+        if (onSelectNode) onSelectNode(toSemanticSelectionPayload(node));
       }
 
       function highlightByTrace(queryType, queryValue, includeContext) {
@@ -1434,6 +1803,7 @@
 
       return {
         highlightByTrace,
+        focusNodeById: focusSemanticNode,
       };
     }
 
@@ -1495,6 +1865,11 @@
       treeHeader.textContent = "AST Tree (Text)";
       const treeWrap = document.createElement("div");
       treeWrap.className = "treeWrap";
+      const sourceHeader = document.createElement("div");
+      sourceHeader.className = "fileHeader";
+      sourceHeader.textContent = "Source Viewer (IDE-style)";
+      const sourceWrap = document.createElement("div");
+      sourceWrap.className = "sourceWrap";
       const scopePanel = document.createElement("div");
       scopePanel.className = "panel";
       scopePanel.innerHTML = "<h4>Scope Inspector (click AST node)</h4>";
@@ -1502,6 +1877,9 @@
       scopeBody.className = "panelBody";
       scopeBody.textContent = "Select AST node to inspect scope.";
       scopePanel.appendChild(scopeBody);
+      const childrenBox = document.createElement("div");
+      childrenBox.className = "childrenList";
+      scopePanel.appendChild(childrenBox);
 
       const tracePanel = document.createElement("div");
       tracePanel.className = "panel";
@@ -1546,16 +1924,69 @@
       viewerGrid.appendChild(calls);
       viewerGrid.appendChild(treeHeader);
       viewerGrid.appendChild(treeWrap);
+      viewerGrid.appendChild(sourceHeader);
+      viewerGrid.appendChild(sourceWrap);
       resultRoot.appendChild(viewerGrid);
 
       for (let i = 0; i < projectAst.files.length; i += 1) {
         const f = projectAst.files[i];
+        const nodeCount = countAstNodes(f.ast);
         const option = document.createElement("option");
         option.value = String(i);
-        option.textContent = `${f.path} [${f.language}]`;
+        option.textContent = `${f.path} [${f.language}] nodes:${nodeCount}`;
         fileSelect.appendChild(option);
       }
       let graphController = null;
+      let activeRanges = [{ start: 1, end: 1 }];
+
+      function renderChildrenList(childNodes, file) {
+        childrenBox.innerHTML = "";
+        const items = childNodes || [];
+        const header = document.createElement("div");
+        header.className = "panelBody";
+        header.style.whiteSpace = "normal";
+        header.textContent = `Children: ${items.length}`;
+        childrenBox.appendChild(header);
+
+        if (!items.length) {
+          const none = document.createElement("div");
+          none.className = "panelBody";
+          none.style.whiteSpace = "normal";
+          none.textContent = "No child nodes.";
+          childrenBox.appendChild(none);
+          return;
+        }
+
+        for (const child of items.slice(0, 120)) {
+          const row = document.createElement("div");
+          row.className = "childRow";
+          const label = document.createElement("span");
+          label.textContent = child.label || child.kind || `node ${child.node_id}`;
+          const btn = document.createElement("button");
+          btn.className = "childBtn";
+          btn.textContent = "Go";
+          const goToChild = () => {
+            if (graphController && typeof graphController.focusNodeById === "function") {
+              graphController.focusNodeById(child.node_id);
+            }
+            if (child.start_position && child.end_position) {
+              renderSourceViewer(file, sourceWrap, [{
+                start: child.start_position.row,
+                end: child.end_position.row,
+              }], true);
+            }
+          };
+          row.style.cursor = "pointer";
+          row.addEventListener("click", goToChild);
+          btn.addEventListener("click", (event) => {
+            event.stopPropagation();
+            goToChild();
+          });
+          row.appendChild(label);
+          row.appendChild(btn);
+          childrenBox.appendChild(row);
+        }
+      }
 
       function renderSelected() {
         const idx = Number(fileSelect.value || 0);
@@ -1580,6 +2011,9 @@
         tree.open = true;
         treeWrap.appendChild(tree);
         scopeBody.textContent = "Select AST node to inspect scope.";
+        renderChildrenList([], file);
+        activeRanges = [{ start: 1, end: 1 }];
+        renderSourceViewer(file, sourceWrap, activeRanges, true);
         if (graphModeSelect.value === "semantic") {
           graphController = renderSemanticGraph(projectAst, file, graphWrap, layoutSelect.value, (selectedNode) => {
             scopeBody.textContent = [
@@ -1587,11 +2021,27 @@
               `kind: ${selectedNode.kind}`,
               `label: ${selectedNode.text || ""}`,
             ].join("\n");
+            renderChildrenList(selectedNode.child_nodes || [], file);
+            if (selectedNode.start_position && selectedNode.end_position) {
+              activeRanges = [{
+                start: selectedNode.start_position.row,
+                end: selectedNode.end_position.row,
+              }];
+              renderSourceViewer(file, sourceWrap, activeRanges, true);
+            }
           });
         } else {
           graphController = renderGraph(file.ast, graphWrap, layoutSelect.value, (selectedNode) => {
             const scope = findBestScopeForNode(selectedNode, indexData.scopes);
             scopeBody.textContent = formatScopeDetails(selectedNode, scope, indexData);
+            renderChildrenList(selectedNode.child_nodes || [], file);
+            if (selectedNode.start_position && selectedNode.end_position) {
+              activeRanges = [{
+                start: selectedNode.start_position.row,
+                end: selectedNode.end_position.row,
+              }];
+              renderSourceViewer(file, sourceWrap, activeRanges, true);
+            }
           });
         }
       }
@@ -1599,6 +2049,13 @@
       function runTrace() {
         const value = traceInput.value || "";
         const traceReport = buildProjectTrace(projectAst, traceType.value, value);
+        const idx = Number(fileSelect.value || 0);
+        const file = projectAst.files[idx];
+        const traceRanges = file ? collectMatchingRangesForTrace(file, traceType.value, value, 120) : [];
+        activeRanges = traceRanges.length ? traceRanges : [{ start: 1, end: 1 }];
+        if (file) {
+          renderSourceViewer(file, sourceWrap, activeRanges, true);
+        }
         let graphReport = "";
         if (graphController) {
           const includeContext = contextToggle.checked;
@@ -1615,7 +2072,16 @@
       traceInput.addEventListener("keydown", (event) => {
         if (event.key === "Enter") runTrace();
       });
-      fileSelect.value = "0";
+      let defaultIdx = 0;
+      let bestNodes = -1;
+      for (let i = 0; i < projectAst.files.length; i += 1) {
+        const n = countAstNodes(projectAst.files[i].ast);
+        if (n > bestNodes) {
+          bestNodes = n;
+          defaultIdx = i;
+        }
+      }
+      fileSelect.value = String(defaultIdx);
       layoutSelect.value = "hierarchical";
       renderSelected();
     }
