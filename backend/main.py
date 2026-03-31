@@ -5,10 +5,11 @@ import tempfile
 from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 RUST_ANALYZER_DIR = ROOT_DIR / "rust-analyzer"
@@ -28,6 +29,10 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+class AnalyzePathRequest(BaseModel):
+    path: str
 
 
 def ensure_rust_binary() -> None:
@@ -64,7 +69,7 @@ def ensure_rust_binary() -> None:
         )
 
 
-def run_analyzer(project_dir: Path) -> dict:
+def run_analyzer(project_dir: Path) -> str:
     ensure_rust_binary()
     max_workers = os.cpu_count() or 1
     cmd = [
@@ -85,15 +90,7 @@ def run_analyzer(project_dir: Path) -> dict:
             ),
         )
 
-    try:
-        import json
-
-        return json.loads(result.stdout)
-    except Exception as exc:  # pragma: no cover
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to decode analyzer JSON output: {exc}",
-        ) from exc
+    return result.stdout
 
 
 @app.get("/")
@@ -112,7 +109,7 @@ def list_samples() -> dict:
 
 
 @app.post("/api/analyze-sample/{sample_name}")
-def analyze_sample(sample_name: str) -> dict:
+def analyze_sample(sample_name: str) -> Response:
     sample_path = (SAMPLES_DIR / sample_name).resolve()
     if not sample_path.exists() or not sample_path.is_dir():
         raise HTTPException(status_code=404, detail=f"Sample not found: {sample_name}")
@@ -120,11 +117,27 @@ def analyze_sample(sample_name: str) -> dict:
     if SAMPLES_DIR.resolve() not in sample_path.parents:
         raise HTTPException(status_code=400, detail="Invalid sample path")
 
-    return run_analyzer(sample_path)
+    return Response(content=run_analyzer(sample_path), media_type="application/json")
 
 
 @app.post("/api/analyze-upload")
-async def analyze_upload(files: List[UploadFile] = File(...)) -> dict:
+async def analyze_upload(request: Request) -> Response:
+    try:
+        form = await request.form(max_files=20000, max_fields=20000)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Failed to parse uploaded files. "
+                "Try uploading a smaller folder batch or increase server limits."
+            ),
+        ) from exc
+
+    files = []
+    for key, value in form.multi_items():
+        if key == "files" and hasattr(value, "filename") and hasattr(value, "file"):
+            files.append(value)
+
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
@@ -142,7 +155,15 @@ async def analyze_upload(files: List[UploadFile] = File(...)) -> dict:
             with dest_path.open("wb") as destination:
                 shutil.copyfileobj(uploaded.file, destination)
 
-        return run_analyzer(tmp_path)
+        return Response(content=run_analyzer(tmp_path), media_type="application/json")
+
+
+@app.post("/api/analyze-local-path")
+def analyze_local_path(payload: AnalyzePathRequest) -> Response:
+    local_path = Path(payload.path).expanduser().resolve()
+    if not local_path.exists() or not local_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"Directory not found: {local_path}")
+    return Response(content=run_analyzer(local_path), media_type="application/json")
 
 
 @app.get("/health")

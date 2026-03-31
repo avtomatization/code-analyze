@@ -252,6 +252,15 @@
       border-radius: 8px;
       padding: 8px 10px;
     }
+    #pathInput {
+      flex: 1;
+      min-width: 380px;
+      background: #0f172a;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
     code {
       background: #0f172a;
       padding: 1px 4px;
@@ -271,10 +280,20 @@
     </div>
 
     <div class="card">
-      <h3>Analyze your local project folder</h3>
-      <input id="folderInput" type="file" webkitdirectory directory multiple />
-      <button id="analyzeUploadBtn">Analyze selected folder</button>
-      <p class="muted">Supports Java (.java), C# (.cs), Python (.py).</p>
+      <h3>Analyze project (recommended: local path)</h3>
+      <div class="traceRow">
+        <input id="pathInput" type="text" placeholder="/absolute/path/to/project" />
+        <button id="analyzePathBtn">Analyze by local path</button>
+      </div>
+      <p class="muted">Use this mode for reliable scanning of large projects (no browser upload limits).</p>
+      <details style="margin-top:8px;">
+        <summary style="cursor:pointer;color:#93c5fd;">Legacy browser upload (small folders only)</summary>
+        <div style="margin-top:8px;">
+          <input id="folderInput" type="file" webkitdirectory directory multiple />
+          <button id="analyzeUploadBtn">Analyze selected folder</button>
+          <p class="muted">Supports Java (.java), C# (.cs), Python (.py).</p>
+        </div>
+      </details>
     </div>
 
     <div class="card">
@@ -289,8 +308,12 @@
     const analyzeSampleBtn = document.getElementById("analyzeSampleBtn");
     const folderInput = document.getElementById("folderInput");
     const analyzeUploadBtn = document.getElementById("analyzeUploadBtn");
+    const pathInput = document.getElementById("pathInput");
+    const analyzePathBtn = document.getElementById("analyzePathBtn");
     const statusEl = document.getElementById("status");
     const resultRoot = document.getElementById("resultRoot");
+    const SUPPORTED_EXTENSIONS = new Set([".java", ".cs", ".py"]);
+    const MAX_UPLOAD_FILES = 20000;
 
     function setStatus(msg) {
       statusEl.textContent = msg;
@@ -1408,6 +1431,7 @@
       ensureNode(fileRootId, {
         label: file.path,
         kind: "file",
+        filePath: file.path,
         details: `file: ${file.path}\nlanguage: ${file.language}`,
       });
 
@@ -1418,6 +1442,7 @@
           label: `${humanizeKind(sym.kind)} ${sym.name}`.trim(),
           kind: "symbol",
           symbolKind: sym.kind,
+          symbolName: sym.name || "",
           filePath: sym.file_path,
           start_position: sym.range ? sym.range.start : null,
           end_position: sym.range ? sym.range.end : null,
@@ -1448,6 +1473,8 @@
         ensureNode(depId, {
           label: dep.slice(0, 80),
           kind: "dependency",
+          depName: dep,
+          filePath: file.path,
           start_position: { row: 1, column: 1 },
           end_position: { row: 1, column: 1 },
           details: `dependency: ${dep}\nfile: ${file.path}`,
@@ -1469,6 +1496,8 @@
           ensureNode(calleeId, {
             label: `Unresolved call ${call.callee_name}`,
             kind: "unresolved",
+            calleeName: call.callee_name || "",
+            filePath: file.path,
             start_position: { row: call.location.row, column: call.location.column },
             end_position: { row: call.location.row, column: call.location.column },
             details: [
@@ -1754,6 +1783,41 @@
         if (onSelectNode) onSelectNode(toSemanticSelectionPayload(node));
       }
 
+      function matchesSemanticNodeForTrace(node, queryType, queryValue) {
+        const q = (queryValue || "").trim().toLowerCase();
+        if (!q) return false;
+        const nodeKind = String(node.kind || "").toLowerCase();
+        const symbolKind = String(node.symbolKind || "").toLowerCase();
+        const symbolName = String(node.symbolName || "").toLowerCase();
+        const calleeName = String(node.calleeName || "").toLowerCase();
+        const depName = String(node.depName || "").toLowerCase();
+        const label = String(node.label || "").toLowerCase();
+        const details = String(node.details || "").toLowerCase();
+
+        if (queryType === "line") {
+          const n = Number.parseInt(q, 10);
+          if (!Number.isFinite(n)) return false;
+          const start = node.start_position ? Number(node.start_position.row) : null;
+          const end = node.end_position ? Number(node.end_position.row) : start;
+          return start !== null && end !== null && start <= n && n <= end;
+        }
+        if (queryType === "class") {
+          return nodeKind === "symbol" && symbolKind === "class" && symbolName.includes(q);
+        }
+        if (queryType === "method") {
+          const isMethodSymbol = nodeKind === "symbol" && (symbolKind === "method" || symbolKind === "constructor");
+          const isCallNode = nodeKind === "unresolved";
+          return (isMethodSymbol && symbolName.includes(q)) || (isCallNode && calleeName.includes(q));
+        }
+        if (queryType === "variable") {
+          return nodeKind === "symbol" && (symbolKind === "variable" || symbolKind === "parameter") && symbolName.includes(q);
+        }
+        if (queryType === "string") {
+          return label.includes(q) || details.includes(q) || depName.includes(q);
+        }
+        return label.includes(q) || details.includes(q) || depName.includes(q);
+      }
+
       function highlightByTrace(queryType, queryValue, includeContext) {
         const q = (queryValue || "").trim().toLowerCase();
         if (!q) {
@@ -1762,9 +1826,7 @@
         }
         const matched = new Set();
         for (const n of all) {
-          const label = (n.label || "").toLowerCase();
-          const details = (n.details || "").toLowerCase();
-          if (label.includes(q) || details.includes(q)) {
+          if (matchesSemanticNodeForTrace(n, queryType, q)) {
             matched.add(n.id);
           }
         }
@@ -2110,14 +2172,48 @@
     }
 
     async function analyzeUpload() {
-      const files = folderInput.files;
-      if (!files || !files.length) {
-        setStatus("Please select a folder first.");
+      const directPath = (pathInput.value || "").trim();
+      if (directPath) {
+        setStatus("Path is provided; using local-path mode for reliable scan...");
+        await analyzeByPath();
         return;
       }
-      setStatus(`Uploading ${files.length} files and building AST...`);
+
+      const files = folderInput.files;
+      if (!files || !files.length) {
+        setStatus("Please provide a local path (recommended) or select a folder for legacy upload.");
+        return;
+      }
+
+      const selected = Array.from(files);
+      const supported = [];
+      let skipped = 0;
+      for (const file of selected) {
+        const relPath = file.webkitRelativePath || file.name;
+        const lower = relPath.toLowerCase();
+        let ok = false;
+        for (const ext of SUPPORTED_EXTENSIONS) {
+          if (lower.endsWith(ext)) {
+            ok = true;
+            break;
+          }
+        }
+        if (ok) supported.push(file);
+        else skipped += 1;
+      }
+
+      if (!supported.length) {
+        setStatus("No supported source files found. Select folder with .java/.cs/.py files.");
+        return;
+      }
+      if (supported.length > MAX_UPLOAD_FILES) {
+        setStatus(`Too many supported files (${supported.length}). Max is ${MAX_UPLOAD_FILES}. Narrow selected folder.`);
+        return;
+      }
+
+      setStatus(`Uploading ${supported.length} source files (${skipped} skipped) and building AST...`);
       const formData = new FormData();
-      for (const file of files) {
+      for (const file of supported) {
         const relPath = file.webkitRelativePath || file.name;
         formData.append("files", file, relPath);
       }
@@ -2128,12 +2224,50 @@
           body: formData,
         });
         if (!response.ok) {
-          const err = await response.text();
-          throw new Error(err);
+          let errText = await response.text();
+          try {
+            const parsed = JSON.parse(errText);
+            if (parsed && parsed.detail) errText = parsed.detail;
+          } catch (_) {
+            // Keep plain text body when not JSON
+          }
+          throw new Error(errText || `HTTP ${response.status}`);
         }
         const data = await response.json();
         renderAst(data);
         setStatus("Uploaded project AST built successfully.");
+      } catch (error) {
+        const hint = "Browser upload can fail on large folders. Use 'Analyze by local path' instead.";
+        setStatus(`Error: ${error.message}. ${hint}`);
+      }
+    }
+
+    async function analyzeByPath() {
+      const p = (pathInput.value || "").trim();
+      if (!p) {
+        setStatus("Please provide an absolute local path.");
+        return;
+      }
+      setStatus(`Analyzing local path: ${p}`);
+      try {
+        const response = await fetch("/api/analyze-local-path", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: p }),
+        });
+        if (!response.ok) {
+          let errText = await response.text();
+          try {
+            const parsed = JSON.parse(errText);
+            if (parsed && parsed.detail) errText = parsed.detail;
+          } catch (_) {
+            // Keep plain response when not JSON
+          }
+          throw new Error(errText || `HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        renderAst(data);
+        setStatus("Local path AST built successfully.");
       } catch (error) {
         setStatus(`Error: ${error.message}`);
       }
@@ -2141,6 +2275,10 @@
 
     analyzeSampleBtn.addEventListener("click", analyzeSample);
     analyzeUploadBtn.addEventListener("click", analyzeUpload);
+    analyzePathBtn.addEventListener("click", analyzeByPath);
+    pathInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") analyzeByPath();
+    });
     loadSamples().catch((e) => setStatus(`Failed to load samples: ${e.message}`));
   </script>
 </body>
