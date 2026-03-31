@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Code Analyze AST Viewer</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #101828;
+      color: #e2e8f0;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    button, select, input[type="file"] {
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-right: 8px;
+      margin-top: 8px;
+      cursor: pointer;
+    }
+    select {
+      background: #334155;
+    }
+    .muted {
+      color: #94a3b8;
+      font-size: 14px;
+    }
+    #status {
+      margin-top: 8px;
+      color: #38bdf8;
+    }
+    details {
+      margin-left: 12px;
+      padding: 2px 0;
+    }
+    summary {
+      cursor: pointer;
+      color: #cbd5e1;
+      font-family: Menlo, monospace;
+      font-size: 13px;
+    }
+    .fileHeader {
+      margin-top: 20px;
+      margin-bottom: 8px;
+      font-weight: bold;
+      color: #f8fafc;
+    }
+    .calls {
+      margin-left: 8px;
+      margin-bottom: 16px;
+      color: #d1d5db;
+      font-size: 13px;
+    }
+    .viewerGrid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    .graphWrap {
+      border: 1px solid #334155;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 70vh;
+      background: #0b1220;
+      padding: 8px;
+    }
+    .treeWrap {
+      border: 1px solid #334155;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 45vh;
+      padding: 8px;
+    }
+    .controlRow {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 8px 0 12px;
+    }
+    .badge {
+      display: inline-block;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+    .graphNote {
+      margin-top: 4px;
+      color: #94a3b8;
+      font-size: 12px;
+    }
+    code {
+      background: #0f172a;
+      padding: 1px 4px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Code Analyze: Full AST</h1>
+    <p class="muted">Rust parser (Java/C#) + FastAPI backend + AST visualization.</p>
+
+    <div class="card">
+      <h3>Analyze sample project</h3>
+      <select id="sampleSelect"></select>
+      <button id="analyzeSampleBtn">Analyze sample</button>
+    </div>
+
+    <div class="card">
+      <h3>Analyze your local project folder</h3>
+      <input id="folderInput" type="file" webkitdirectory directory multiple />
+      <button id="analyzeUploadBtn">Analyze selected folder</button>
+      <p class="muted">Supports Java (.java) and C# (.cs).</p>
+    </div>
+
+    <div class="card">
+      <h3>Result</h3>
+      <div id="status">Waiting for action...</div>
+      <div id="resultRoot"></div>
+    </div>
+  </div>
+
+  <script>
+    const sampleSelect = document.getElementById("sampleSelect");
+    const analyzeSampleBtn = document.getElementById("analyzeSampleBtn");
+    const folderInput = document.getElementById("folderInput");
+    const analyzeUploadBtn = document.getElementById("analyzeUploadBtn");
+    const statusEl = document.getElementById("status");
+    const resultRoot = document.getElementById("resultRoot");
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    async function loadSamples() {
+      const response = await fetch("/api/samples");
+      const data = await response.json();
+      sampleSelect.innerHTML = "";
+      for (const sample of data.samples || []) {
+        const option = document.createElement("option");
+        option.value = sample;
+        option.textContent = sample;
+        sampleSelect.appendChild(option);
+      }
+      if (!sampleSelect.options.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "No samples found";
+        sampleSelect.appendChild(option);
+      }
+    }
+
+    function createNodeElement(node) {
+      const details = document.createElement("details");
+      details.open = false;
+      const summary = document.createElement("summary");
+
+      let title = node.kind;
+      if (node.text) {
+        title += ` :: ${node.text.replace(/\s+/g, " ").slice(0, 80)}`;
+      }
+      summary.textContent = title;
+      details.appendChild(summary);
+
+      if (node.children && node.children.length) {
+        for (const child of node.children) {
+          details.appendChild(createNodeElement(child));
+        }
+      }
+      return details;
+    }
+
+    function createSvgEl(tag, attrs = {}) {
+      const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+      for (const [k, v] of Object.entries(attrs)) {
+        el.setAttribute(k, String(v));
+      }
+      return el;
+    }
+
+    function buildGraphData(root, maxNodes = 900) {
+      const nodes = [];
+      const edges = [];
+      let nodeId = 0;
+      let wasClamped = false;
+
+      function walk(node, depth, parentId = null) {
+        if (nodes.length >= maxNodes) {
+          wasClamped = true;
+          return null;
+        }
+        const currentId = nodeId++;
+        nodes.push({
+          id: currentId,
+          depth,
+          kind: node.kind,
+          text: node.text || "",
+        });
+        if (parentId !== null) {
+          edges.push({ from: parentId, to: currentId });
+        }
+        for (const child of node.children || []) {
+          walk(child, depth + 1, currentId);
+          if (nodes.length >= maxNodes) {
+            break;
+          }
+        }
+        return currentId;
+      }
+
+      walk(root, 0, null);
+      return { nodes, edges, wasClamped };
+    }
+
+    function renderGraph(astRoot, mount) {
+      mount.innerHTML = "";
+      const graphData = buildGraphData(astRoot, 900);
+      const { nodes, edges, wasClamped } = graphData;
+      if (!nodes.length) {
+        mount.textContent = "No AST nodes to display.";
+        return;
+      }
+
+      const levels = new Map();
+      for (const node of nodes) {
+        if (!levels.has(node.depth)) levels.set(node.depth, []);
+        levels.get(node.depth).push(node);
+      }
+
+      const depthGap = 240;
+      const rowGap = 28;
+      let maxDepth = 0;
+      let rowIndex = 0;
+      for (const [depth, levelNodes] of levels.entries()) {
+        maxDepth = Math.max(maxDepth, depth);
+        for (const n of levelNodes) {
+          n.x = 40 + depth * depthGap;
+          n.y = 24 + rowIndex * rowGap;
+          rowIndex += 1;
+        }
+      }
+
+      const width = Math.max(1000, 140 + (maxDepth + 1) * depthGap);
+      const height = Math.max(300, rowIndex * rowGap + 50);
+
+      const svg = createSvgEl("svg", { width, height });
+      svg.style.background = "#0b1220";
+
+      const nodeById = new Map(nodes.map((n) => [n.id, n]));
+      for (const edge of edges) {
+        const from = nodeById.get(edge.from);
+        const to = nodeById.get(edge.to);
+        if (!from || !to) continue;
+        const line = createSvgEl("line", {
+          x1: from.x + 120,
+          y1: from.y,
+          x2: to.x - 8,
+          y2: to.y,
+          stroke: "#334155",
+          "stroke-width": 1.2,
+        });
+        svg.appendChild(line);
+      }
+
+      for (const node of nodes) {
+        const g = createSvgEl("g");
+        const rect = createSvgEl("rect", {
+          x: node.x - 6,
+          y: node.y - 12,
+          width: 220,
+          height: 22,
+          rx: 6,
+          fill: "#1e293b",
+          stroke: "#475569",
+        });
+
+        const label = node.text
+          ? `${node.kind} :: ${node.text.replace(/\s+/g, " ").slice(0, 42)}`
+          : node.kind;
+        const text = createSvgEl("text", {
+          x: node.x,
+          y: node.y + 4,
+          fill: "#e2e8f0",
+          "font-size": 11,
+          "font-family": "Menlo, monospace",
+        });
+        text.textContent = label;
+        g.appendChild(rect);
+        g.appendChild(text);
+        svg.appendChild(g);
+      }
+
+      mount.appendChild(svg);
+
+      const note = document.createElement("div");
+      note.className = "graphNote";
+      note.textContent = wasClamped
+        ? "Graph is truncated to first 900 nodes for performance."
+        : `Graph nodes: ${nodes.length}`;
+      mount.appendChild(note);
+    }
+
+    function renderAst(projectAst) {
+      resultRoot.innerHTML = "";
+      const projectInfo = document.createElement("p");
+      const workers = projectAst.max_workers ?? "n/a";
+      projectInfo.innerHTML = `Root: <code>${projectAst.root_path}</code>, files parsed: <code>${projectAst.files.length}</code>, max workers: <code>${workers}</code>`;
+      resultRoot.appendChild(projectInfo);
+
+      const controlRow = document.createElement("div");
+      controlRow.className = "controlRow";
+      const fileLabel = document.createElement("span");
+      fileLabel.textContent = "File:";
+      const fileSelect = document.createElement("select");
+      const callsCount = document.createElement("span");
+      callsCount.className = "badge";
+      const langBadge = document.createElement("span");
+      langBadge.className = "badge";
+      controlRow.appendChild(fileLabel);
+      controlRow.appendChild(fileSelect);
+      controlRow.appendChild(langBadge);
+      controlRow.appendChild(callsCount);
+      resultRoot.appendChild(controlRow);
+
+      const viewerGrid = document.createElement("div");
+      viewerGrid.className = "viewerGrid";
+      const graphHeader = document.createElement("div");
+      graphHeader.className = "fileHeader";
+      graphHeader.textContent = "AST Graph";
+      const graphWrap = document.createElement("div");
+      graphWrap.className = "graphWrap";
+      const callsHeader = document.createElement("div");
+      callsHeader.className = "fileHeader";
+      callsHeader.textContent = "Detected Calls";
+      const calls = document.createElement("div");
+      calls.className = "calls";
+      const treeHeader = document.createElement("div");
+      treeHeader.className = "fileHeader";
+      treeHeader.textContent = "AST Tree (Text)";
+      const treeWrap = document.createElement("div");
+      treeWrap.className = "treeWrap";
+      viewerGrid.appendChild(graphHeader);
+      viewerGrid.appendChild(graphWrap);
+      viewerGrid.appendChild(callsHeader);
+      viewerGrid.appendChild(calls);
+      viewerGrid.appendChild(treeHeader);
+      viewerGrid.appendChild(treeWrap);
+      resultRoot.appendChild(viewerGrid);
+
+      for (let i = 0; i < projectAst.files.length; i += 1) {
+        const f = projectAst.files[i];
+        const option = document.createElement("option");
+        option.value = String(i);
+        option.textContent = `${f.path} [${f.language}]`;
+        fileSelect.appendChild(option);
+      }
+
+      function renderSelected() {
+        const idx = Number(fileSelect.value || 0);
+        const file = projectAst.files[idx];
+        if (!file) return;
+        langBadge.textContent = `language: ${file.language}`;
+        callsCount.textContent = `calls: ${(file.calls || []).length}`;
+
+        calls.innerHTML = "";
+        if (file.calls && file.calls.length) {
+          calls.innerHTML = file.calls.slice(0, 80).map((c) => {
+            const ctx = c.caller_context ? c.caller_context : "global";
+            return `- <code>${ctx}</code> -> <code>${c.callee_snippet}</code>`;
+          }).join("<br>");
+        } else {
+          calls.innerHTML = "none";
+        }
+
+        treeWrap.innerHTML = "";
+        const tree = createNodeElement(file.ast);
+        tree.open = true;
+        treeWrap.appendChild(tree);
+        renderGraph(file.ast, graphWrap);
+      }
+
+      fileSelect.addEventListener("change", renderSelected);
+      fileSelect.value = "0";
+      renderSelected();
+    }
+
+    async function analyzeSample() {
+      const selected = sampleSelect.value;
+      if (!selected) {
+        setStatus("No sample selected.");
+        return;
+      }
+      setStatus("Analyzing sample...");
+      try {
+        const response = await fetch(`/api/analyze-sample/${encodeURIComponent(selected)}`, {
+          method: "POST",
+        });
+        if (!response.ok) {
+          const err = await response.text();
+          throw new Error(err);
+        }
+        const data = await response.json();
+        renderAst(data);
+        setStatus("Sample AST built successfully.");
+      } catch (error) {
+        setStatus(`Error: ${error.message}`);
+      }
+    }
+
+    async function analyzeUpload() {
+      const files = folderInput.files;
+      if (!files || !files.length) {
+        setStatus("Please select a folder first.");
+        return;
+      }
+      setStatus(`Uploading ${files.length} files and building AST...`);
+      const formData = new FormData();
+      for (const file of files) {
+        const relPath = file.webkitRelativePath || file.name;
+        formData.append("files", file, relPath);
+      }
+
+      try {
+        const response = await fetch("/api/analyze-upload", {
+          method: "POST",
+          body: formData,
+        });
+        if (!response.ok) {
+          const err = await response.text();
+          throw new Error(err);
+        }
+        const data = await response.json();
+        renderAst(data);
+        setStatus("Uploaded project AST built successfully.");
+      } catch (error) {
+        setStatus(`Error: ${error.message}`);
+      }
+    }
+
+    analyzeSampleBtn.addEventListener("click", analyzeSample);
+    analyzeUploadBtn.addEventListener("click", analyzeUpload);
+    loadSamples().catch((e) => setStatus(`Failed to load samples: ${e.message}`));
+  </script>
+</body>
+</html>
