@@ -72,12 +72,17 @@
       gap: 12px;
     }
     .graphWrap {
+      position: relative;
       border: 1px solid #334155;
       border-radius: 8px;
       overflow: auto;
       max-height: 70vh;
       background: #0b1220;
       padding: 8px;
+    }
+    .graphWrap svg {
+      user-select: none;
+      touch-action: none;
     }
     .treeWrap {
       border: 1px solid #334155;
@@ -106,6 +111,83 @@
       margin-top: 4px;
       color: #94a3b8;
       font-size: 12px;
+    }
+    .legend {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+    .legendItem {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .legendDot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+    .nodeTooltip {
+      position: fixed;
+      z-index: 9999;
+      pointer-events: none;
+      max-width: 420px;
+      background: rgba(2, 6, 23, 0.96);
+      border: 1px solid #334155;
+      color: #e2e8f0;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+      display: none;
+    }
+    .panel {
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: #0b1220;
+      padding: 10px;
+      margin-top: 8px;
+    }
+    .panel h4 {
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      color: #e2e8f0;
+    }
+    .panelBody {
+      font-size: 13px;
+      color: #cbd5e1;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .traceRow {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+    .traceToggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+    #traceQueryInput {
+      flex: 1;
+      min-width: 280px;
+      background: #0f172a;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 8px 10px;
     }
     code {
       background: #0f172a;
@@ -212,8 +294,11 @@
         nodes.push({
           id: currentId,
           depth,
+          parentId,
           kind: node.kind,
           text: node.text || "",
+          start_position: node.start_position,
+          end_position: node.end_position,
         });
         if (parentId !== null) {
           edges.push({ from: parentId, to: currentId });
@@ -231,92 +316,1125 @@
       return { nodes, edges, wasClamped };
     }
 
-    function renderGraph(astRoot, mount) {
+    function indexGraph(nodes, edges) {
+      const nodeById = new Map(nodes.map((n) => [n.id, { ...n, children: [] }]));
+      for (const edge of edges) {
+        const parent = nodeById.get(edge.from);
+        if (parent) parent.children.push(edge.to);
+      }
+      return nodeById;
+    }
+
+    function computeTreeBase(nodeById, rootId = 0) {
+      let leafCounter = 0;
+      let maxDepth = 0;
+
+      function assignOrder(id) {
+        const node = nodeById.get(id);
+        if (!node) return 0;
+        maxDepth = Math.max(maxDepth, node.depth);
+        if (!node.children.length) {
+          node.order = leafCounter;
+          leafCounter += 1;
+          return node.order;
+        }
+        let sum = 0;
+        for (const childId of node.children) {
+          sum += assignOrder(childId);
+        }
+        node.order = sum / node.children.length;
+        return node.order;
+      }
+
+      assignOrder(rootId);
+      return { leafCount: Math.max(leafCounter, 1), maxDepth };
+    }
+
+    function computeFlatLayout(nodes) {
+      const depthGap = 240;
+      const rowGap = 28;
+      let rowIndex = 0;
+      let maxDepth = 0;
+      for (const n of nodes) {
+        n.x = 40 + n.depth * depthGap;
+        n.y = 24 + rowIndex * rowGap;
+        maxDepth = Math.max(maxDepth, n.depth);
+        rowIndex += 1;
+      }
+      return {
+        width: Math.max(1000, 140 + (maxDepth + 1) * depthGap),
+        height: Math.max(300, rowIndex * rowGap + 50),
+      };
+    }
+
+    function computeHierarchicalLayout(nodeById) {
+      const { leafCount, maxDepth } = computeTreeBase(nodeById, 0);
+      const siblingGap = 52;
+      const levelGap = 92;
+      for (const node of nodeById.values()) {
+        node.x = 70 + node.order * siblingGap;
+        node.y = 40 + node.depth * levelGap;
+      }
+      return {
+        width: Math.max(1000, 120 + leafCount * siblingGap),
+        height: Math.max(420, 120 + maxDepth * levelGap),
+      };
+    }
+
+    function computeRadialLayout(nodeById) {
+      const { leafCount, maxDepth } = computeTreeBase(nodeById, 0);
+      const radiusStep = 90;
+      const maxRadius = 60 + maxDepth * radiusStep;
+      const size = Math.max(900, maxRadius * 2 + 320);
+      const cx = size / 2;
+      const cy = size / 2;
+      const denominator = Math.max(leafCount - 1, 1);
+
+      for (const node of nodeById.values()) {
+        const angle = (node.order / denominator) * (Math.PI * 2) - Math.PI / 2;
+        const radius = 30 + node.depth * radiusStep;
+        node.x = cx + Math.cos(angle) * radius;
+        node.y = cy + Math.sin(angle) * radius;
+      }
+      return { width: size, height: size };
+    }
+
+    function posLessOrEqual(a, b) {
+      if (a.row < b.row) return true;
+      if (a.row > b.row) return false;
+      return a.column <= b.column;
+    }
+
+    function rangeContains(rangeStart, rangeEnd, point) {
+      return posLessOrEqual(rangeStart, point) && posLessOrEqual(point, rangeEnd);
+    }
+
+    function getFirstIdentifier(node) {
+      if (!node) return null;
+      if (node.kind === "identifier" && node.text) {
+        return node.text.trim();
+      }
+      for (const child of node.children || []) {
+        const found = getFirstIdentifier(child);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    function collectNodeIndex(fileAst) {
+      const scopes = [];
+      const dependencies = [];
+      const declarations = {
+        classes: [],
+        methods: [],
+        variables: [],
+      };
+
+      const scopeKinds = new Set([
+        "program",
+        "namespace_declaration",
+        "class_declaration",
+        "method_declaration",
+        "constructor_declaration",
+        "local_function_statement",
+        "block",
+      ]);
+      const methodKinds = new Set([
+        "method_declaration",
+        "constructor_declaration",
+        "local_function_statement",
+      ]);
+      const dependencyKinds = new Set([
+        "import_declaration",
+        "using_directive",
+        "package_declaration",
+      ]);
+      const variableKinds = new Set(["variable_declarator", "parameter"]);
+
+      function walk(node, scopeStack = []) {
+        const kind = node.kind;
+        const nodeName = getFirstIdentifier(node) || (node.text ? node.text.slice(0, 40) : kind);
+        let enteredScope = null;
+
+        if (scopeKinds.has(kind)) {
+          enteredScope = {
+            kind,
+            name: nodeName,
+            start: node.start_position,
+            end: node.end_position,
+            variables: [],
+            methods: [],
+            classes: [],
+            depth: scopeStack.length,
+          };
+          scopes.push(enteredScope);
+          scopeStack.push(enteredScope);
+        }
+
+        const currentScope = scopeStack[scopeStack.length - 1];
+        if (kind === "class_declaration") {
+          const className = getFirstIdentifier(node) || "anonymous_class";
+          declarations.classes.push({ name: className, kind, node });
+          if (currentScope) currentScope.classes.push(className);
+        }
+        if (methodKinds.has(kind)) {
+          const methodName = getFirstIdentifier(node) || "anonymous_method";
+          declarations.methods.push({ name: methodName, kind, node });
+          if (currentScope) currentScope.methods.push(methodName);
+        }
+        if (variableKinds.has(kind)) {
+          const varName = getFirstIdentifier(node);
+          if (varName) {
+            declarations.variables.push({ name: varName, kind, node });
+            if (currentScope) currentScope.variables.push(varName);
+          }
+        }
+        if (dependencyKinds.has(kind) && node.text) {
+          dependencies.push(node.text.replace(/\s+/g, " ").trim());
+        }
+
+        for (const child of node.children || []) {
+          walk(child, scopeStack);
+        }
+
+        if (enteredScope) {
+          scopeStack.pop();
+        }
+      }
+
+      walk(fileAst, []);
+      return { scopes, dependencies, declarations };
+    }
+
+    function findBestScopeForNode(nodeRef, scopes) {
+      if (!nodeRef) return null;
+      const p = nodeRef.start_position;
+      const candidates = scopes.filter((s) => rangeContains(s.start, s.end, p));
+      if (!candidates.length) return null;
+      candidates.sort((a, b) => a.depth - b.depth);
+      return candidates[candidates.length - 1];
+    }
+
+    function formatScopeDetails(nodeRef, scope, indexData) {
+      if (!nodeRef || !scope) return "Select AST node to inspect scope.";
+      const chain = indexData.scopes
+        .filter((s) => rangeContains(s.start, s.end, nodeRef.start_position))
+        .sort((a, b) => a.depth - b.depth)
+        .map((s) => `${s.kind}(${s.name})`);
+      const uniq = (arr) => Array.from(new Set(arr)).slice(0, 80);
+
+      const lines = [];
+      lines.push(`Node: ${nodeRef.kind}`);
+      if (nodeRef.text) lines.push(`Text: ${nodeRef.text.replace(/\s+/g, " ").slice(0, 160)}`);
+      lines.push(`Position: ${nodeRef.start_position.row}:${nodeRef.start_position.column}`);
+      lines.push("");
+      lines.push(`Current scope: ${scope.kind}(${scope.name})`);
+      lines.push(`Scope chain: ${chain.join(" -> ") || "n/a"}`);
+      lines.push(`Variables in scope (${scope.variables.length}): ${uniq(scope.variables).join(", ") || "none"}`);
+      lines.push(`Methods in scope (${scope.methods.length}): ${uniq(scope.methods).join(", ") || "none"}`);
+      lines.push(`Classes in scope (${scope.classes.length}): ${uniq(scope.classes).join(", ") || "none"}`);
+      return lines.join("\n");
+    }
+
+    function buildProjectTrace(projectAst, queryType, queryValue) {
+      const q = (queryValue || "").trim().toLowerCase();
+      if (!q) {
+        return "Provide query text to build trace.";
+      }
+
+      const matches = [];
+      const relatedCalls = [];
+      const relatedDependencies = [];
+
+      for (const file of projectAst.files || []) {
+        const indexData = collectNodeIndex(file.ast);
+        const filePath = file.path;
+
+        if (queryType === "class") {
+          for (const c of indexData.declarations.classes) {
+            if (c.name.toLowerCase().includes(q)) {
+              matches.push(`[class] ${c.name} @ ${filePath}`);
+            }
+          }
+        } else if (queryType === "method") {
+          for (const m of indexData.declarations.methods) {
+            if (m.name.toLowerCase().includes(q)) {
+              matches.push(`[method] ${m.name} @ ${filePath}`);
+            }
+          }
+        } else if (queryType === "variable") {
+          for (const v of indexData.declarations.variables) {
+            if (v.name.toLowerCase().includes(q)) {
+              matches.push(`[variable] ${v.name} @ ${filePath}`);
+            }
+          }
+        } else if (queryType === "line") {
+          const lineNum = Number.parseInt(q, 10);
+          if (Number.isFinite(lineNum)) {
+            const scopesForLine = indexData.scopes.filter(
+              (s) => s.start.row <= lineNum && lineNum <= s.end.row
+            );
+            for (const s of scopesForLine.slice(0, 8)) {
+              matches.push(`[line] ${lineNum} in ${s.kind}(${s.name}) @ ${filePath}`);
+            }
+          }
+        } else {
+          const rootText = file.ast.text || "";
+          if (rootText.toLowerCase().includes(q)) {
+            matches.push(`[string] match in root snippet @ ${filePath}`);
+          }
+        }
+
+        for (const call of file.calls || []) {
+          const caller = (call.caller_context || "").toLowerCase();
+          const callee = (call.callee_snippet || "").toLowerCase();
+          if (caller.includes(q) || callee.includes(q)) {
+            relatedCalls.push(`${filePath}: ${call.caller_context || "global"} -> ${call.callee_snippet}`);
+          }
+        }
+
+        for (const dep of indexData.dependencies) {
+          if (dep.toLowerCase().includes(q)) {
+            relatedDependencies.push(`${filePath}: ${dep}`);
+          }
+        }
+      }
+
+      const uniq = (arr) => Array.from(new Set(arr));
+      const m = uniq(matches).slice(0, 120);
+      const c = uniq(relatedCalls).slice(0, 120);
+      const d = uniq(relatedDependencies).slice(0, 80);
+
+      const lines = [];
+      lines.push(`Trace query: type=${queryType}, value="${queryValue}"`);
+      lines.push("");
+      lines.push(`Matches (${m.length}):`);
+      lines.push(m.length ? m.join("\n") : "none");
+      lines.push("");
+      lines.push(`Calls (${c.length}):`);
+      lines.push(c.length ? c.join("\n") : "none");
+      lines.push("");
+      lines.push(`Dependencies (${d.length}):`);
+      lines.push(d.length ? d.join("\n") : "none");
+      return lines.join("\n");
+    }
+
+    function attachPanZoom(svg, viewport) {
+      let scale = 1;
+      let tx = 0;
+      let ty = 0;
+      let draggingPointerId = null;
+      let lastX = 0;
+      let lastY = 0;
+
+      function applyTransform() {
+        viewport.setAttribute("transform", `matrix(${scale} 0 0 ${scale} ${tx} ${ty})`);
+      }
+
+      svg.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        const rect = svg.getBoundingClientRect();
+        const mx = event.clientX - rect.left;
+        const my = event.clientY - rect.top;
+        const worldX = (mx - tx) / scale;
+        const worldY = (my - ty) / scale;
+        const direction = event.deltaY < 0 ? 1 : -1;
+        const zoomFactor = direction > 0 ? 1.12 : 0.9;
+        const nextScale = Math.min(4, Math.max(0.2, scale * zoomFactor));
+        tx = mx - worldX * nextScale;
+        ty = my - worldY * nextScale;
+        scale = nextScale;
+        applyTransform();
+      }, { passive: false });
+
+      svg.addEventListener("pointerdown", (event) => {
+        const nodeHit = event.target && event.target.closest ? event.target.closest("[data-node-id]") : null;
+        if (nodeHit) {
+          return;
+        }
+        draggingPointerId = event.pointerId;
+        lastX = event.clientX;
+        lastY = event.clientY;
+        svg.setPointerCapture(event.pointerId);
+      });
+
+      svg.addEventListener("pointermove", (event) => {
+        if (draggingPointerId !== event.pointerId) return;
+        const dx = event.clientX - lastX;
+        const dy = event.clientY - lastY;
+        tx += dx;
+        ty += dy;
+        lastX = event.clientX;
+        lastY = event.clientY;
+        applyTransform();
+      });
+
+      function stopDragging(event) {
+        if (draggingPointerId !== event.pointerId) return;
+        draggingPointerId = null;
+        try {
+          svg.releasePointerCapture(event.pointerId);
+        } catch (_) {
+          // Ignore release errors if capture is already gone.
+        }
+      }
+      svg.addEventListener("pointerup", stopDragging);
+      svg.addEventListener("pointercancel", stopDragging);
+
+      svg.addEventListener("dblclick", () => {
+        scale = 1;
+        tx = 0;
+        ty = 0;
+        applyTransform();
+      });
+
+      applyTransform();
+    }
+
+    function buildNodeTooltip(node, nodeById) {
+      if (!node) return "";
+      const parent = node.parentId !== null && node.parentId !== undefined ? nodeById.get(node.parentId) : null;
+      const lines = [];
+      lines.push(`kind: ${node.kind}`);
+      lines.push(`id: ${node.id}`);
+      lines.push(`depth: ${node.depth}`);
+      if (node.text) {
+        lines.push(`text: ${node.text.replace(/\s+/g, " ").slice(0, 180)}`);
+      }
+      if (node.start_position && node.end_position) {
+        lines.push(`range: ${node.start_position.row}:${node.start_position.column} -> ${node.end_position.row}:${node.end_position.column}`);
+      }
+      lines.push(`children: ${(node.children || []).length}`);
+      lines.push(`parent: ${parent ? `${parent.kind}#${parent.id}` : "none(root)"}`);
+      return lines.join("\n");
+    }
+
+    function boxesIntersect(a, b) {
+      return !(a.x2 < b.x1 || b.x2 < a.x1 || a.y2 < b.y1 || b.y2 < a.y1);
+    }
+
+    function estimateLabelBox(x, y, text, fontSize = 11) {
+      const width = Math.max(26, Math.min(520, text.length * (fontSize * 0.58)));
+      const height = fontSize + 4;
+      return { x1: x, y1: y - fontSize, x2: x + width, y2: y - fontSize + height };
+    }
+
+    function placeLabelNoOverlap(nodeX, nodeY, text, occupiedBoxes, options = {}) {
+      const fontSize = options.fontSize || 11;
+      const baseDx = options.baseDx || 8;
+      const candidates = options.candidates || [
+        { dx: baseDx, dy: -6 },
+        { dx: baseDx, dy: 10 },
+        { dx: baseDx, dy: -18 },
+        { dx: baseDx, dy: 22 },
+        { dx: baseDx, dy: -30 },
+        { dx: baseDx, dy: 34 },
+        { dx: -(Math.min(420, text.length * 6) + 10), dy: -6 },
+      ];
+
+      for (const c of candidates) {
+        const x = nodeX + c.dx;
+        const y = nodeY + c.dy;
+        const box = estimateLabelBox(x, y, text, fontSize);
+        const collision = occupiedBoxes.some((used) => boxesIntersect(used, box));
+        if (!collision) {
+          occupiedBoxes.push(box);
+          return { x, y, hidden: false };
+        }
+      }
+      return { x: nodeX + baseDx, y: nodeY - 6, hidden: true };
+    }
+
+    function nodeMatchesTrace(node, queryType, queryRaw) {
+      const q = (queryRaw || "").trim().toLowerCase();
+      if (!q) return false;
+      const kind = (node.kind || "").toLowerCase();
+      const text = (node.text || "").toLowerCase();
+      if (queryType === "line") {
+        const lineNum = Number.parseInt(q, 10);
+        if (!Number.isFinite(lineNum) || !node.start_position || !node.end_position) return false;
+        return node.start_position.row <= lineNum && lineNum <= node.end_position.row;
+      }
+      if (queryType === "class") {
+        return (kind.includes("class") || kind.includes("interface") || kind.includes("type")) && text.includes(q);
+      }
+      if (queryType === "method") {
+        return (kind.includes("method") || kind.includes("function") || kind.includes("invocation")) && text.includes(q);
+      }
+      if (queryType === "variable") {
+        return (kind.includes("variable") || kind.includes("identifier") || kind.includes("parameter") || kind.includes("field")) && text.includes(q);
+      }
+      return kind.includes(q) || text.includes(q);
+    }
+
+    function expandRelatedNodes(seedIds, nodeById, maxNodes = 1800) {
+      const related = new Set(seedIds);
+      const queue = [...seedIds];
+      while (queue.length && related.size < maxNodes) {
+        const id = queue.shift();
+        const node = nodeById.get(id);
+        if (!node) continue;
+        if (node.parentId !== null && node.parentId !== undefined && !related.has(node.parentId)) {
+          related.add(node.parentId);
+          queue.push(node.parentId);
+        }
+        for (const childId of node.children || []) {
+          if (!related.has(childId)) {
+            related.add(childId);
+            queue.push(childId);
+            if (related.size >= maxNodes) break;
+          }
+        }
+      }
+      return related;
+    }
+
+    function renderGraph(astRoot, mount, layoutMode, onSelectNode) {
       mount.innerHTML = "";
       const graphData = buildGraphData(astRoot, 900);
       const { nodes, edges, wasClamped } = graphData;
       if (!nodes.length) {
         mount.textContent = "No AST nodes to display.";
-        return;
+        return {
+          highlightByTrace() {
+            return { matched: 0, related: 0 };
+          },
+        };
       }
 
-      const levels = new Map();
-      for (const node of nodes) {
-        if (!levels.has(node.depth)) levels.set(node.depth, []);
-        levels.get(node.depth).push(node);
-      }
-
-      const depthGap = 240;
-      const rowGap = 28;
-      let maxDepth = 0;
-      let rowIndex = 0;
-      for (const [depth, levelNodes] of levels.entries()) {
-        maxDepth = Math.max(maxDepth, depth);
-        for (const n of levelNodes) {
-          n.x = 40 + depth * depthGap;
-          n.y = 24 + rowIndex * rowGap;
-          rowIndex += 1;
+      const nodeById = indexGraph(nodes, edges);
+      let size;
+      if (layoutMode === "hierarchical") {
+        size = computeHierarchicalLayout(nodeById);
+      } else if (layoutMode === "radial") {
+        size = computeRadialLayout(nodeById);
+      } else {
+        size = computeFlatLayout(nodes);
+        for (const n of nodes) {
+          const mapped = nodeById.get(n.id);
+          if (mapped) {
+            mapped.x = n.x;
+            mapped.y = n.y;
+          }
         }
       }
 
-      const width = Math.max(1000, 140 + (maxDepth + 1) * depthGap);
-      const height = Math.max(300, rowIndex * rowGap + 50);
-
+      const width = size.width;
+      const height = size.height;
       const svg = createSvgEl("svg", { width, height });
       svg.style.background = "#0b1220";
+      svg.style.cursor = "grab";
+      const viewport = createSvgEl("g");
+      svg.appendChild(viewport);
+      const tooltip = document.createElement("div");
+      tooltip.className = "nodeTooltip";
+      mount.appendChild(tooltip);
 
-      const nodeById = new Map(nodes.map((n) => [n.id, n]));
+      const edgeByChildId = new Map();
+      const edgeRecords = [];
       for (const edge of edges) {
         const from = nodeById.get(edge.from);
         const to = nodeById.get(edge.to);
         if (!from || !to) continue;
         const line = createSvgEl("line", {
-          x1: from.x + 120,
+          x1: from.x,
           y1: from.y,
-          x2: to.x - 8,
+          x2: to.x,
           y2: to.y,
           stroke: "#334155",
           "stroke-width": 1.2,
         });
-        svg.appendChild(line);
+        viewport.appendChild(line);
+        edgeByChildId.set(edge.to, line);
+        edgeRecords.push({ from: edge.from, to: edge.to, line });
       }
 
-      for (const node of nodes) {
+      const circleByNodeId = new Map();
+      const textByNodeId = new Map();
+      const baseTextOpacityByNodeId = new Map();
+      const occupiedLabelBoxes = [];
+      for (const node of nodeById.values()) {
         const g = createSvgEl("g");
-        const rect = createSvgEl("rect", {
-          x: node.x - 6,
-          y: node.y - 12,
-          width: 220,
-          height: 22,
-          rx: 6,
-          fill: "#1e293b",
-          stroke: "#475569",
+        g.setAttribute("data-node-id", String(node.id));
+        const hitArea = createSvgEl("circle", {
+          cx: node.x,
+          cy: node.y,
+          r: 12,
+          fill: "transparent",
         });
-
+        const circle = createSvgEl("circle", {
+          cx: node.x,
+          cy: node.y,
+          r: 4,
+          fill: "#22d3ee",
+          stroke: "#67e8f9",
+          "stroke-width": 0.8,
+        });
         const label = node.text
           ? `${node.kind} :: ${node.text.replace(/\s+/g, " ").slice(0, 42)}`
           : node.kind;
+        const labelPlacement = placeLabelNoOverlap(node.x, node.y, label, occupiedLabelBoxes, {
+          fontSize: 11,
+          baseDx: 8,
+        });
         const text = createSvgEl("text", {
-          x: node.x,
-          y: node.y + 4,
+          x: labelPlacement.x,
+          y: labelPlacement.y,
+          fill: "#e2e8f0",
+          "font-size": 11,
+          "font-family": "Menlo, monospace",
+          opacity: labelPlacement.hidden ? 0.14 : 1,
+        });
+        baseTextOpacityByNodeId.set(node.id, labelPlacement.hidden ? "0.14" : "1");
+        text.textContent = label;
+        g.appendChild(hitArea);
+        g.appendChild(circle);
+        g.appendChild(text);
+        g.style.cursor = "pointer";
+        viewport.appendChild(g);
+        circleByNodeId.set(node.id, circle);
+        textByNodeId.set(node.id, text);
+
+        g.addEventListener("pointerdown", (event) => {
+          event.stopPropagation();
+        });
+        g.addEventListener("click", (event) => {
+          event.stopPropagation();
+          highlightPathToRoot(node.id);
+          if (onSelectNode) onSelectNode(node);
+        });
+        g.addEventListener("mouseenter", () => {
+          tooltip.textContent = buildNodeTooltip(node, nodeById);
+          tooltip.style.display = "block";
+        });
+        g.addEventListener("mousemove", (event) => {
+          tooltip.style.left = `${event.clientX + 14}px`;
+          tooltip.style.top = `${event.clientY + 14}px`;
+        });
+        g.addEventListener("mouseleave", () => {
+          tooltip.style.display = "none";
+        });
+      }
+
+      mount.appendChild(svg);
+      attachPanZoom(svg, viewport);
+
+      function resetStyles() {
+        for (const edge of edgeRecords) {
+          edge.line.setAttribute("stroke", "#334155");
+          edge.line.setAttribute("stroke-width", "1.2");
+          edge.line.setAttribute("opacity", "1");
+        }
+        for (const [id, circle] of circleByNodeId.entries()) {
+          circle.setAttribute("fill", "#22d3ee");
+          circle.setAttribute("r", "4");
+          const txt = textByNodeId.get(id);
+          if (txt) {
+            txt.setAttribute("fill", "#e2e8f0");
+            txt.setAttribute("opacity", baseTextOpacityByNodeId.get(id) || "1");
+          }
+        }
+      }
+
+      function highlightPathToRoot(selectedId) {
+        resetStyles();
+
+        let currentId = selectedId;
+        while (currentId !== null && currentId !== undefined) {
+          const currentNode = nodeById.get(currentId);
+          if (!currentNode) break;
+          const circle = circleByNodeId.get(currentId);
+          if (circle) {
+            circle.setAttribute("fill", "#f59e0b");
+            circle.setAttribute("r", "5.5");
+          }
+          const txt = textByNodeId.get(currentId);
+          if (txt) {
+            txt.setAttribute("fill", "#fde68a");
+          }
+
+          const edge = edgeByChildId.get(currentId);
+          if (edge) {
+            edge.setAttribute("stroke", "#f59e0b");
+            edge.setAttribute("stroke-width", "2.2");
+          }
+          currentId = currentNode.parentId;
+        }
+      }
+
+      function highlightByTrace(queryType, queryValue, includeContext) {
+        const q = (queryValue || "").trim();
+        if (!q) {
+          highlightPathToRoot(0);
+          return { matched: 0, related: 0 };
+        }
+
+        const matchedIds = [];
+        for (const node of nodeById.values()) {
+          if (nodeMatchesTrace(node, queryType, q)) {
+            matchedIds.push(node.id);
+          }
+        }
+        if (!matchedIds.length) {
+          highlightPathToRoot(0);
+          return { matched: 0, related: 0 };
+        }
+
+        const matchedSet = new Set(matchedIds);
+        const relatedSet = includeContext
+          ? expandRelatedNodes(matchedIds, nodeById, 1800)
+          : new Set(matchedIds);
+        resetStyles();
+
+        for (const edge of edgeRecords) {
+          const inRelated = relatedSet.has(edge.from) && relatedSet.has(edge.to);
+          if (inRelated) {
+            edge.line.setAttribute("stroke", "#3b82f6");
+            edge.line.setAttribute("stroke-width", "1.5");
+            edge.line.setAttribute("opacity", "0.9");
+          }
+          if (matchedSet.has(edge.from) || matchedSet.has(edge.to)) {
+            edge.line.setAttribute("stroke", "#f59e0b");
+            edge.line.setAttribute("stroke-width", "2.2");
+            edge.line.setAttribute("opacity", "1");
+          }
+        }
+
+        for (const nodeId of relatedSet) {
+          const circle = circleByNodeId.get(nodeId);
+          const txt = textByNodeId.get(nodeId);
+          if (circle) {
+            circle.setAttribute("fill", "#60a5fa");
+            circle.setAttribute("r", "4.8");
+          }
+          if (txt) {
+            txt.setAttribute("fill", "#bfdbfe");
+          }
+        }
+        for (const nodeId of matchedSet) {
+          const circle = circleByNodeId.get(nodeId);
+          const txt = textByNodeId.get(nodeId);
+          if (circle) {
+            circle.setAttribute("fill", "#f59e0b");
+            circle.setAttribute("r", "6");
+          }
+          if (txt) {
+            txt.setAttribute("fill", "#fde68a");
+          }
+        }
+        return { matched: matchedSet.size, related: relatedSet.size };
+      }
+
+      highlightPathToRoot(0);
+      if (onSelectNode) {
+        const root = nodeById.get(0);
+        if (root) onSelectNode(root);
+      }
+
+      const note = document.createElement("div");
+      note.className = "graphNote";
+      const layoutLabel = layoutMode === "flat"
+        ? "flat"
+        : layoutMode === "hierarchical"
+          ? "hierarchical"
+          : "radial";
+      note.textContent = wasClamped
+        ? `Layout: ${layoutLabel}. Graph is truncated to first 900 nodes. Mouse wheel: zoom, drag: pan, click node: highlight path to root.`
+        : `Layout: ${layoutLabel}. Graph nodes: ${nodes.length}. Mouse wheel: zoom, drag: pan, click node: highlight path to root.`;
+      mount.appendChild(note);
+      return {
+        highlightByTrace,
+        highlightPathToRoot,
+      };
+    }
+
+    function buildSemanticGraphData(projectAst, file) {
+      const nodes = [];
+      const edges = [];
+      const nodeById = new Map();
+      const symbolByFq = new Map();
+      const symbolBySimple = new Map();
+
+      function ensureNode(id, payload) {
+        if (!nodeById.has(id)) {
+          const node = { id, ...payload };
+          nodeById.set(id, node);
+          nodes.push(node);
+        }
+        return nodeById.get(id);
+      }
+
+      const fileRootId = `file:${file.path}`;
+      ensureNode(fileRootId, {
+        label: file.path,
+        kind: "file",
+        details: `file: ${file.path}\nlanguage: ${file.language}`,
+      });
+
+      const allSymbols = projectAst.semantic && projectAst.semantic.symbols ? projectAst.semantic.symbols : [];
+      for (const sym of allSymbols) {
+        const id = `sym:${sym.id}`;
+        ensureNode(id, {
+          label: sym.fq_name || sym.name,
+          kind: "symbol",
+          symbolKind: sym.kind,
+          filePath: sym.file_path,
+          details: [
+            `symbol: ${sym.name}`,
+            `fq: ${sym.fq_name}`,
+            `kind: ${sym.kind}`,
+            `file: ${sym.file_path}`,
+            `scope: ${sym.scope}`,
+            `range: ${sym.range.start.row}:${sym.range.start.column} -> ${sym.range.end.row}:${sym.range.end.column}`,
+          ].join("\n"),
+        });
+        symbolByFq.set((sym.fq_name || "").toLowerCase(), id);
+        symbolBySimple.set((sym.name || "").toLowerCase(), id);
+      }
+
+      const fileSymbols = (file.semantic && file.semantic.symbols) ? file.semantic.symbols : [];
+      for (const sym of fileSymbols) {
+        const sid = symbolByFq.get((sym.fq_name || "").toLowerCase()) || symbolBySimple.get((sym.name || "").toLowerCase());
+        if (sid) {
+          edges.push({ from: fileRootId, to: sid, kind: "contains" });
+        }
+      }
+
+      const deps = (file.semantic && file.semantic.dependencies) ? file.semantic.dependencies : [];
+      for (const dep of deps) {
+        const depId = `dep:${file.path}:${dep}`;
+        ensureNode(depId, {
+          label: dep.slice(0, 80),
+          kind: "dependency",
+          details: `dependency: ${dep}\nfile: ${file.path}`,
+        });
+        edges.push({ from: fileRootId, to: depId, kind: "dependency" });
+      }
+
+      const resolvedCalls = (file.semantic && file.semantic.resolved_calls) ? file.semantic.resolved_calls : [];
+      for (const call of resolvedCalls) {
+        const callerName = (call.caller_context || "").split(" ").slice(1).join(" ").trim();
+        const callerId = symbolBySimple.get(callerName.toLowerCase()) || fileRootId;
+        let calleeId = null;
+
+        if (call.resolved_to) {
+          calleeId = symbolByFq.get(call.resolved_to.toLowerCase()) || symbolBySimple.get(call.callee_name.toLowerCase());
+        }
+        if (!calleeId) {
+          calleeId = `unresolved:${file.path}:${call.callee_name}:${call.location.row}:${call.location.column}`;
+          ensureNode(calleeId, {
+            label: `unresolved ${call.callee_name}`,
+            kind: "unresolved",
+            details: [
+              `callee: ${call.callee_name}`,
+              `resolved_to: ${call.resolved_to || "none"}`,
+              `confidence: ${call.confidence}`,
+              `location: ${call.location.row}:${call.location.column}`,
+            ].join("\n"),
+          });
+        }
+
+        edges.push({
+          from: callerId,
+          to: calleeId,
+          kind: call.resolved_to ? "resolved_call" : "unresolved_call",
+          confidence: call.confidence,
+          calleeName: call.callee_name,
+          location: call.location,
+        });
+      }
+
+      return { nodes, edges };
+    }
+
+    function renderSemanticGraph(projectAst, file, mount, layoutMode, onSelectNode) {
+      mount.innerHTML = "";
+      const { nodes, edges } = buildSemanticGraphData(projectAst, file);
+      if (!nodes.length) {
+        mount.textContent = "No semantic nodes to display.";
+        return {
+          highlightByTrace() {
+            return { matched: 0, related: 0 };
+          },
+        };
+      }
+
+      const nodeById = new Map(nodes.map((n) => [n.id, { ...n, children: [] }]));
+      const inDegree = new Map(nodes.map((n) => [n.id, 0]));
+      for (const edge of edges) {
+        const from = nodeById.get(edge.from);
+        if (from) from.children.push(edge.to);
+        inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1);
+      }
+
+      if (layoutMode === "radial") {
+        const size = 1200;
+        const cx = size / 2;
+        const cy = size / 2;
+        const radiusStep = 90;
+        const arr = Array.from(nodeById.values());
+        for (let i = 0; i < arr.length; i += 1) {
+          const angle = (i / Math.max(arr.length, 1)) * Math.PI * 2;
+          const level = Math.floor(i / 20);
+          arr[i].x = cx + Math.cos(angle) * (120 + level * radiusStep);
+          arr[i].y = cy + Math.sin(angle) * (120 + level * radiusStep);
+        }
+      } else if (layoutMode === "hierarchical") {
+        const queue = [];
+        for (const [id, deg] of inDegree.entries()) {
+          if (deg === 0) queue.push({ id, level: 0 });
+        }
+        if (!queue.length) {
+          const first = nodes[0];
+          queue.push({ id: first.id, level: 0 });
+        }
+        const levels = new Map();
+        const seen = new Set();
+        while (queue.length) {
+          const item = queue.shift();
+          if (seen.has(item.id)) continue;
+          seen.add(item.id);
+          if (!levels.has(item.level)) levels.set(item.level, []);
+          levels.get(item.level).push(item.id);
+          const n = nodeById.get(item.id);
+          for (const childId of n.children || []) {
+            queue.push({ id: childId, level: item.level + 1 });
+          }
+        }
+        const lvlGap = 210;
+        const rowGap = 36;
+        for (const [level, ids] of levels.entries()) {
+          for (let i = 0; i < ids.length; i += 1) {
+            const n = nodeById.get(ids[i]);
+            n.x = 60 + level * lvlGap;
+            n.y = 40 + i * rowGap;
+          }
+        }
+      } else {
+        const cols = 5;
+        const gapX = 260;
+        const gapY = 52;
+        const arr = Array.from(nodeById.values());
+        for (let i = 0; i < arr.length; i += 1) {
+          const row = Math.floor(i / cols);
+          const col = i % cols;
+          arr[i].x = 60 + col * gapX;
+          arr[i].y = 50 + row * gapY;
+        }
+      }
+
+      const all = Array.from(nodeById.values());
+      const maxX = Math.max(...all.map((n) => n.x || 0), 1000);
+      const maxY = Math.max(...all.map((n) => n.y || 0), 500);
+      const width = Math.max(1200, maxX + 260);
+      const height = Math.max(620, maxY + 80);
+
+      const svg = createSvgEl("svg", { width, height });
+      svg.style.background = "#0b1220";
+      svg.style.cursor = "grab";
+      const viewport = createSvgEl("g");
+      svg.appendChild(viewport);
+      const tooltip = document.createElement("div");
+      tooltip.className = "nodeTooltip";
+      mount.appendChild(tooltip);
+
+      const edgeEls = [];
+      for (const edge of edges) {
+        const from = nodeById.get(edge.from);
+        const to = nodeById.get(edge.to);
+        if (!from || !to) continue;
+        const isUnresolved = edge.kind === "unresolved_call";
+        const isDependency = edge.kind === "dependency";
+        const stroke = isUnresolved ? "#ef4444" : isDependency ? "#22d3ee" : "#60a5fa";
+        const line = createSvgEl("line", {
+          x1: from.x,
+          y1: from.y,
+          x2: to.x,
+          y2: to.y,
+          stroke,
+          "stroke-width": isUnresolved ? 1.9 : 1.4,
+          opacity: 0.9,
+        });
+        viewport.appendChild(line);
+        edgeEls.push({ edge, line });
+      }
+
+      const nodeCircle = new Map();
+      const nodeText = new Map();
+      const semanticBaseTextOpacityByNodeId = new Map();
+      const occupiedSemanticLabelBoxes = [];
+      for (const node of all) {
+        const g = createSvgEl("g");
+        g.setAttribute("data-node-id", String(node.id));
+        const hitArea = createSvgEl("circle", {
+          cx: node.x,
+          cy: node.y,
+          r: 12,
+          fill: "transparent",
+        });
+        const color = node.kind === "unresolved"
+          ? "#ef4444"
+          : node.kind === "dependency"
+            ? "#22d3ee"
+            : node.kind === "file"
+              ? "#a78bfa"
+              : "#22c55e";
+        const circle = createSvgEl("circle", {
+          cx: node.x,
+          cy: node.y,
+          r: 5,
+          fill: color,
+          stroke: "#e2e8f0",
+          "stroke-width": 0.8,
+        });
+        const text = createSvgEl("text", {
+          x: 0,
+          y: 0,
           fill: "#e2e8f0",
           "font-size": 11,
           "font-family": "Menlo, monospace",
         });
-        text.textContent = label;
-        g.appendChild(rect);
+        const labelText = node.label.slice(0, 70);
+        const labelPlacement = placeLabelNoOverlap(node.x, node.y, labelText, occupiedSemanticLabelBoxes, {
+          fontSize: 11,
+          baseDx: 8,
+          candidates: [
+            { dx: 8, dy: -6 },
+            { dx: 8, dy: 10 },
+            { dx: -150, dy: -6 },
+            { dx: 8, dy: -18 },
+            { dx: 8, dy: 22 },
+            { dx: -150, dy: 10 },
+          ],
+        });
+        text.setAttribute("x", String(labelPlacement.x));
+        text.setAttribute("y", String(labelPlacement.y));
+        text.setAttribute("opacity", labelPlacement.hidden ? "0.14" : "1");
+        semanticBaseTextOpacityByNodeId.set(node.id, labelPlacement.hidden ? "0.14" : "1");
+        text.textContent = labelText;
+        g.appendChild(hitArea);
+        g.appendChild(circle);
         g.appendChild(text);
-        svg.appendChild(g);
+        g.style.cursor = "pointer";
+        viewport.appendChild(g);
+        nodeCircle.set(node.id, circle);
+        nodeText.set(node.id, text);
+
+        g.addEventListener("pointerdown", (event) => event.stopPropagation());
+        g.addEventListener("mouseenter", () => {
+          tooltip.textContent = [
+            `kind: ${node.kind}`,
+            `label: ${node.label}`,
+            node.details || "",
+          ].join("\n");
+          tooltip.style.display = "block";
+        });
+        g.addEventListener("mousemove", (event) => {
+          tooltip.style.left = `${event.clientX + 14}px`;
+          tooltip.style.top = `${event.clientY + 14}px`;
+        });
+        g.addEventListener("mouseleave", () => {
+          tooltip.style.display = "none";
+        });
+        g.addEventListener("click", (event) => {
+          event.stopPropagation();
+          if (onSelectNode) {
+            onSelectNode({
+              kind: `semantic:${node.kind}`,
+              text: node.label,
+              start_position: { row: 1, column: 1 },
+              end_position: { row: 1, column: 1 },
+            });
+          }
+          for (const [id, c] of nodeCircle.entries()) {
+            c.setAttribute("r", "5");
+            const t = nodeText.get(id);
+            if (t) t.setAttribute("fill", "#e2e8f0");
+          }
+          circle.setAttribute("r", "7");
+          text.setAttribute("fill", "#fde68a");
+        });
       }
 
       mount.appendChild(svg);
+      attachPanZoom(svg, viewport);
 
-      const note = document.createElement("div");
-      note.className = "graphNote";
-      note.textContent = wasClamped
-        ? "Graph is truncated to first 900 nodes for performance."
-        : `Graph nodes: ${nodes.length}`;
-      mount.appendChild(note);
+      const legend = document.createElement("div");
+      legend.className = "legend";
+      legend.innerHTML = [
+        "<span class=\"legendItem\"><span class=\"legendDot\" style=\"background:#22c55e\"></span>symbol</span>",
+        "<span class=\"legendItem\"><span class=\"legendDot\" style=\"background:#a78bfa\"></span>file</span>",
+        "<span class=\"legendItem\"><span class=\"legendDot\" style=\"background:#22d3ee\"></span>dependency</span>",
+        "<span class=\"legendItem\"><span class=\"legendDot\" style=\"background:#ef4444\"></span>unresolved</span>",
+      ].join("");
+      mount.appendChild(legend);
+
+      function resetVisuals() {
+        for (const [id, c] of nodeCircle.entries()) {
+          c.setAttribute("opacity", "1");
+          c.setAttribute("r", "5");
+          const t = nodeText.get(id);
+          if (t) {
+            t.setAttribute("opacity", semanticBaseTextOpacityByNodeId.get(id) || "1");
+            t.setAttribute("fill", "#e2e8f0");
+          }
+        }
+        for (const e of edgeEls) {
+          e.line.setAttribute("opacity", "0.9");
+          e.line.setAttribute("stroke-width", e.edge.kind === "unresolved_call" ? "1.9" : "1.4");
+        }
+      }
+
+      function highlightByTrace(queryType, queryValue, includeContext) {
+        const q = (queryValue || "").trim().toLowerCase();
+        if (!q) {
+          resetVisuals();
+          return { matched: 0, related: 0 };
+        }
+        const matched = new Set();
+        for (const n of all) {
+          const label = (n.label || "").toLowerCase();
+          const details = (n.details || "").toLowerCase();
+          if (label.includes(q) || details.includes(q)) {
+            matched.add(n.id);
+          }
+        }
+        const related = new Set(matched);
+        if (includeContext) {
+          for (const e of edges) {
+            if (matched.has(e.from) || matched.has(e.to)) {
+              related.add(e.from);
+              related.add(e.to);
+            }
+          }
+        }
+        resetVisuals();
+        for (const [id, c] of nodeCircle.entries()) {
+          const t = nodeText.get(id);
+          if (!related.has(id)) {
+            c.setAttribute("opacity", "0.2");
+            if (t) t.setAttribute("opacity", "0.2");
+          } else if (matched.has(id)) {
+            c.setAttribute("r", "7");
+            if (t) t.setAttribute("fill", "#fde68a");
+          }
+        }
+        for (const e of edgeEls) {
+          const rel = related.has(e.edge.from) && related.has(e.edge.to);
+          const strong = matched.has(e.edge.from) || matched.has(e.edge.to);
+          if (!rel) {
+            e.line.setAttribute("opacity", "0.12");
+          } else if (strong) {
+            e.line.setAttribute("stroke-width", "2.3");
+            e.line.setAttribute("opacity", "1");
+          }
+        }
+        return { matched: matched.size, related: related.size };
+      }
+
+      return {
+        highlightByTrace,
+      };
     }
 
     function renderAst(projectAst) {
@@ -331,12 +1449,31 @@
       const fileLabel = document.createElement("span");
       fileLabel.textContent = "File:";
       const fileSelect = document.createElement("select");
+      const layoutLabel = document.createElement("span");
+      layoutLabel.textContent = "Layout:";
+      const layoutSelect = document.createElement("select");
+      layoutSelect.innerHTML = [
+        "<option value=\"hierarchical\">Hierarchical tree</option>",
+        "<option value=\"radial\">Radial tree</option>",
+        "<option value=\"flat\">Flat (legacy)</option>",
+      ].join("");
+      const graphModeLabel = document.createElement("span");
+      graphModeLabel.textContent = "Graph:";
+      const graphModeSelect = document.createElement("select");
+      graphModeSelect.innerHTML = [
+        "<option value=\"ast\">AST graph</option>",
+        "<option value=\"semantic\">Semantic graph</option>",
+      ].join("");
       const callsCount = document.createElement("span");
       callsCount.className = "badge";
       const langBadge = document.createElement("span");
       langBadge.className = "badge";
       controlRow.appendChild(fileLabel);
       controlRow.appendChild(fileSelect);
+      controlRow.appendChild(layoutLabel);
+      controlRow.appendChild(layoutSelect);
+      controlRow.appendChild(graphModeLabel);
+      controlRow.appendChild(graphModeSelect);
       controlRow.appendChild(langBadge);
       controlRow.appendChild(callsCount);
       resultRoot.appendChild(controlRow);
@@ -345,7 +1482,7 @@
       viewerGrid.className = "viewerGrid";
       const graphHeader = document.createElement("div");
       graphHeader.className = "fileHeader";
-      graphHeader.textContent = "AST Graph";
+      graphHeader.textContent = "Graph";
       const graphWrap = document.createElement("div");
       graphWrap.className = "graphWrap";
       const callsHeader = document.createElement("div");
@@ -358,8 +1495,53 @@
       treeHeader.textContent = "AST Tree (Text)";
       const treeWrap = document.createElement("div");
       treeWrap.className = "treeWrap";
+      const scopePanel = document.createElement("div");
+      scopePanel.className = "panel";
+      scopePanel.innerHTML = "<h4>Scope Inspector (click AST node)</h4>";
+      const scopeBody = document.createElement("div");
+      scopeBody.className = "panelBody";
+      scopeBody.textContent = "Select AST node to inspect scope.";
+      scopePanel.appendChild(scopeBody);
+
+      const tracePanel = document.createElement("div");
+      tracePanel.className = "panel";
+      tracePanel.innerHTML = "<h4>Trace Builder</h4>";
+      const traceControls = document.createElement("div");
+      traceControls.className = "traceRow";
+      const traceType = document.createElement("select");
+      traceType.innerHTML = [
+        "<option value=\"method\">Method</option>",
+        "<option value=\"class\">Class</option>",
+        "<option value=\"variable\">Variable</option>",
+        "<option value=\"line\">Line</option>",
+        "<option value=\"string\">String</option>",
+      ].join("");
+      const traceInput = document.createElement("input");
+      traceInput.id = "traceQueryInput";
+      traceInput.placeholder = "Expected object (e.g. ProjectCoordinator, chargeUser, userId, 25)";
+      const traceBtn = document.createElement("button");
+      traceBtn.textContent = "Build trace";
+      const contextToggleWrap = document.createElement("label");
+      contextToggleWrap.className = "traceToggle";
+      const contextToggle = document.createElement("input");
+      contextToggle.type = "checkbox";
+      contextToggle.checked = true;
+      contextToggleWrap.appendChild(contextToggle);
+      contextToggleWrap.appendChild(document.createTextNode("Highlight matches + context"));
+      const traceBody = document.createElement("div");
+      traceBody.className = "panelBody";
+      traceBody.textContent = "Enter object and click Build trace.";
+      traceControls.appendChild(traceType);
+      traceControls.appendChild(traceInput);
+      traceControls.appendChild(traceBtn);
+      traceControls.appendChild(contextToggleWrap);
+      tracePanel.appendChild(traceControls);
+      tracePanel.appendChild(traceBody);
+
       viewerGrid.appendChild(graphHeader);
       viewerGrid.appendChild(graphWrap);
+      viewerGrid.appendChild(scopePanel);
+      viewerGrid.appendChild(tracePanel);
       viewerGrid.appendChild(callsHeader);
       viewerGrid.appendChild(calls);
       viewerGrid.appendChild(treeHeader);
@@ -373,11 +1555,13 @@
         option.textContent = `${f.path} [${f.language}]`;
         fileSelect.appendChild(option);
       }
+      let graphController = null;
 
       function renderSelected() {
         const idx = Number(fileSelect.value || 0);
         const file = projectAst.files[idx];
         if (!file) return;
+        const indexData = collectNodeIndex(file.ast);
         langBadge.textContent = `language: ${file.language}`;
         callsCount.textContent = `calls: ${(file.calls || []).length}`;
 
@@ -395,11 +1579,44 @@
         const tree = createNodeElement(file.ast);
         tree.open = true;
         treeWrap.appendChild(tree);
-        renderGraph(file.ast, graphWrap);
+        scopeBody.textContent = "Select AST node to inspect scope.";
+        if (graphModeSelect.value === "semantic") {
+          graphController = renderSemanticGraph(projectAst, file, graphWrap, layoutSelect.value, (selectedNode) => {
+            scopeBody.textContent = [
+              "Semantic node selected:",
+              `kind: ${selectedNode.kind}`,
+              `label: ${selectedNode.text || ""}`,
+            ].join("\n");
+          });
+        } else {
+          graphController = renderGraph(file.ast, graphWrap, layoutSelect.value, (selectedNode) => {
+            const scope = findBestScopeForNode(selectedNode, indexData.scopes);
+            scopeBody.textContent = formatScopeDetails(selectedNode, scope, indexData);
+          });
+        }
+      }
+
+      function runTrace() {
+        const value = traceInput.value || "";
+        const traceReport = buildProjectTrace(projectAst, traceType.value, value);
+        let graphReport = "";
+        if (graphController) {
+          const includeContext = contextToggle.checked;
+          const stats = graphController.highlightByTrace(traceType.value, value, includeContext);
+          graphReport = `\n\nGraph highlight:\nmode: ${includeContext ? "matches + context" : "exact only"}\nmatched nodes: ${stats.matched}\nrelated nodes: ${stats.related}`;
+        }
+        traceBody.textContent = traceReport + graphReport;
       }
 
       fileSelect.addEventListener("change", renderSelected);
+      layoutSelect.addEventListener("change", renderSelected);
+      graphModeSelect.addEventListener("change", renderSelected);
+      traceBtn.addEventListener("click", runTrace);
+      traceInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") runTrace();
+      });
       fileSelect.value = "0";
+      layoutSelect.value = "hierarchical";
       renderSelected();
     }
 

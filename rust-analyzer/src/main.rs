@@ -1,3 +1,5 @@
+use std::char;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -10,7 +12,7 @@ use tree_sitter::{Node, Parser, Point, TreeCursor};
 use walkdir::WalkDir;
 
 #[derive(ClapParser, Debug)]
-#[command(author, version, about = "Build full AST for Java/C# projects")]
+#[command(author, version, about = "Build full AST with semantic graph for Java/C# projects")]
 struct Cli {
     /// Path to project directory
     project_dir: PathBuf,
@@ -29,6 +31,7 @@ struct AstProject {
     root_path: String,
     max_workers: usize,
     files: Vec<AstFile>,
+    semantic: ProjectSemantic,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,6 +40,7 @@ struct AstFile {
     language: LanguageKind,
     ast: AstNode,
     calls: Vec<CallSite>,
+    semantic: FileSemantic,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,17 +54,106 @@ struct AstNode {
     children: Vec<AstNode>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct Position {
     row: usize,
     column: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
+struct Range {
+    start: Position,
+    end: Position,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct CallSite {
     caller_context: Option<String>,
+    callee_name: Option<String>,
     callee_snippet: String,
     kind: String,
+    location: Position,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Symbol {
+    id: String,
+    name: String,
+    fq_name: String,
+    kind: SymbolKind,
+    language: LanguageKind,
+    file_path: String,
+    scope: String,
+    range: Range,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SymbolKind {
+    Class,
+    Method,
+    Constructor,
+    Parameter,
+    Variable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SemanticReference {
+    kind: String,
+    name: String,
+    context: Option<String>,
+    file_path: String,
+    location: Position,
+    resolved_to: Option<String>,
+    confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResolvedCall {
+    caller_context: Option<String>,
+    callee_name: String,
+    kind: String,
+    file_path: String,
+    location: Position,
+    resolved_to: Option<String>,
+    confidence: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct FileSemantic {
+    symbols: Vec<Symbol>,
+    dependencies: Vec<String>,
+    references: Vec<SemanticReference>,
+    resolved_calls: Vec<ResolvedCall>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectSemantic {
+    symbol_count: usize,
+    reference_count: usize,
+    resolved_call_count: usize,
+    unresolved_call_count: usize,
+    symbols: Vec<Symbol>,
+    resolved_calls: Vec<ResolvedCall>,
+}
+
+#[derive(Debug)]
+struct ParsedFileRaw {
+    path: String,
+    language: LanguageKind,
+    ast: AstNode,
+    calls: Vec<CallSite>,
+    symbols: Vec<Symbol>,
+    dependencies: Vec<String>,
+    call_candidates: Vec<CallCandidate>,
+}
+
+#[derive(Debug, Clone)]
+struct CallCandidate {
+    caller_context: Option<String>,
+    callee_name: String,
+    kind: String,
+    file_path: String,
     location: Position,
 }
 
@@ -108,11 +201,9 @@ fn analyze_project(project_dir: &Path, max_workers_override: Option<usize>) -> R
         return Err(anyhow!("Path is not a directory: {}", project_dir.display()));
     }
 
-    let max_workers = max_workers_override.unwrap_or_else(|| {
-        thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-    }).max(1);
+    let max_workers = max_workers_override
+        .unwrap_or_else(|| thread::available_parallelism().map(usize::from).unwrap_or(1))
+        .max(1);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(max_workers)
         .build_global();
@@ -127,50 +218,226 @@ fn analyze_project(project_dir: &Path, max_workers_override: Option<usize>) -> R
         })
         .collect();
 
-    let parsed_files: Vec<Result<AstFile>> = parse_targets
+    let parsed_files: Vec<Result<ParsedFileRaw>> = parse_targets
         .par_iter()
         .map(|(path, language)| parse_file(path, *language, project_dir))
         .collect();
 
-    let mut files = Vec::with_capacity(parsed_files.len());
+    let mut raw_files = Vec::with_capacity(parsed_files.len());
     for parsed in parsed_files {
-        files.push(parsed?);
+        raw_files.push(parsed?);
     }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    raw_files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut class_index: HashMap<String, Vec<Symbol>> = HashMap::new();
+    let mut method_index: HashMap<String, Vec<Symbol>> = HashMap::new();
+    let mut global_symbols: Vec<Symbol> = Vec::new();
+
+    for raw in &raw_files {
+        for symbol in &raw.symbols {
+            global_symbols.push(symbol.clone());
+            match symbol.kind {
+                SymbolKind::Class => {
+                    class_index
+                        .entry(symbol.name.to_lowercase())
+                        .or_default()
+                        .push(symbol.clone());
+                }
+                SymbolKind::Method | SymbolKind::Constructor => {
+                    method_index
+                        .entry(symbol.name.to_lowercase())
+                        .or_default()
+                        .push(symbol.clone());
+                }
+                SymbolKind::Parameter | SymbolKind::Variable => {}
+            }
+        }
+    }
+
+    let mut files = Vec::with_capacity(raw_files.len());
+    let mut project_calls = Vec::new();
+    let mut unresolved_call_count = 0usize;
+    let mut project_reference_count = 0usize;
+
+    for raw in raw_files {
+        let mut references: Vec<SemanticReference> = raw
+            .dependencies
+            .iter()
+            .map(|dep| SemanticReference {
+                kind: "dependency".to_string(),
+                name: dep.clone(),
+                context: None,
+                file_path: raw.path.clone(),
+                location: Position { row: 1, column: 1 },
+                resolved_to: None,
+                confidence: 1.0,
+            })
+            .collect();
+
+        let mut resolved_calls = Vec::new();
+        for call in &raw.call_candidates {
+            let (resolved_to, confidence) = resolve_call(call, &method_index, &class_index);
+            if resolved_to.is_none() {
+                unresolved_call_count += 1;
+            }
+            resolved_calls.push(ResolvedCall {
+                caller_context: call.caller_context.clone(),
+                callee_name: call.callee_name.clone(),
+                kind: call.kind.clone(),
+                file_path: call.file_path.clone(),
+                location: call.location.clone(),
+                resolved_to: resolved_to.clone(),
+                confidence,
+            });
+            references.push(SemanticReference {
+                kind: "call".to_string(),
+                name: call.callee_name.clone(),
+                context: call.caller_context.clone(),
+                file_path: call.file_path.clone(),
+                location: call.location.clone(),
+                resolved_to,
+                confidence,
+            });
+        }
+
+        project_reference_count += references.len();
+        project_calls.extend(resolved_calls.clone());
+        files.push(AstFile {
+            path: raw.path,
+            language: raw.language,
+            ast: raw.ast,
+            calls: raw.calls,
+            semantic: FileSemantic {
+                symbols: raw.symbols,
+                dependencies: raw.dependencies,
+                references,
+                resolved_calls,
+            },
+        });
+    }
 
     Ok(AstProject {
         root_path: project_dir.display().to_string(),
         max_workers,
         files,
+        semantic: ProjectSemantic {
+            symbol_count: global_symbols.len(),
+            reference_count: project_reference_count,
+            resolved_call_count: project_calls.iter().filter(|c| c.resolved_to.is_some()).count(),
+            unresolved_call_count,
+            symbols: global_symbols,
+            resolved_calls: project_calls,
+        },
     })
 }
 
-fn parse_file(path: &Path, language: LanguageKind, project_dir: &Path) -> Result<AstFile> {
+fn parse_file(path: &Path, language: LanguageKind, project_dir: &Path) -> Result<ParsedFileRaw> {
     let mut parser = Parser::new();
     parser
         .set_language(&language.parser_language())
         .with_context(|| format!("Failed to set parser language for {:?}", language))?;
 
-    let source = fs::read_to_string(path)
+    let source_bytes = fs::read(path)
         .with_context(|| format!("Failed to read source file: {}", path.display()))?;
+    let source = decode_source(&source_bytes);
     let tree = parser
         .parse(&source, None)
         .ok_or_else(|| anyhow!("Tree-sitter parse failed: {}", path.display()))?;
 
     let root = tree.root_node();
     let ast = build_ast_node(root, source.as_bytes())?;
-    let calls = collect_calls(root, source.as_bytes());
+    let rel_path = path
+        .strip_prefix(project_dir)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    let (calls, call_candidates) = collect_calls(root, source.as_bytes(), &rel_path);
+    let (symbols, dependencies) = collect_symbols_and_dependencies(root, source.as_bytes(), &rel_path, language);
 
-    Ok(AstFile {
-        path: path
-            .strip_prefix(project_dir)
-            .unwrap_or(path)
-            .display()
-            .to_string(),
+    Ok(ParsedFileRaw {
+        path: rel_path,
         language,
         ast,
         calls,
+        symbols,
+        dependencies,
+        call_candidates,
     })
+}
+
+fn resolve_call(
+    call: &CallCandidate,
+    method_index: &HashMap<String, Vec<Symbol>>,
+    class_index: &HashMap<String, Vec<Symbol>>,
+) -> (Option<String>, f32) {
+    let key = call.callee_name.to_lowercase();
+    if call.kind == "object_creation_expression" {
+        if let Some(candidates) = class_index.get(&key) {
+            return (Some(candidates[0].fq_name.clone()), 0.9);
+        }
+        return (None, 0.0);
+    }
+
+    if let Some(candidates) = method_index.get(&key) {
+        if let Some(caller_ctx) = &call.caller_context {
+            let caller_ctx_lower = caller_ctx.to_lowercase();
+            if let Some(best) = candidates
+                .iter()
+                .find(|symbol| symbol.fq_name.to_lowercase().contains(&caller_ctx_lower))
+            {
+                return (Some(best.fq_name.clone()), 0.95);
+            }
+        }
+        return (Some(candidates[0].fq_name.clone()), 0.7);
+    }
+    (None, 0.0)
+}
+
+fn decode_source(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(&bytes[3..]).into_owned();
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16_units(bytes[2..].chunks_exact(2), Endian::Little);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16_units(bytes[2..].chunks_exact(2), Endian::Big);
+    }
+    if let Ok(utf8) = std::str::from_utf8(bytes) {
+        return utf8.to_string();
+    }
+
+    let nul_ratio = bytes.iter().filter(|b| **b == 0).count() as f32 / bytes.len().max(1) as f32;
+    if nul_ratio > 0.2 {
+        let odd_nul = bytes.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+        let even_nul = bytes.iter().step_by(2).filter(|b| **b == 0).count();
+        if odd_nul >= even_nul {
+            return decode_utf16_units(bytes.chunks_exact(2), Endian::Little);
+        }
+        return decode_utf16_units(bytes.chunks_exact(2), Endian::Big);
+    }
+
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[derive(Clone, Copy)]
+enum Endian {
+    Little,
+    Big,
+}
+
+fn decode_utf16_units<'a, I>(chunks: I, endian: Endian) -> String
+where
+    I: Iterator<Item = &'a [u8]>,
+{
+    let units = chunks.map(|pair| match endian {
+        Endian::Little => u16::from_le_bytes([pair[0], pair[1]]),
+        Endian::Big => u16::from_be_bytes([pair[0], pair[1]]),
+    });
+
+    char::decode_utf16(units)
+        .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
 }
 
 fn build_ast_node(node: Node<'_>, source: &[u8]) -> Result<AstNode> {
@@ -211,18 +478,32 @@ fn collect_children(cursor: &mut TreeCursor<'_>, source: &[u8]) -> Result<Vec<As
     Ok(children)
 }
 
-fn collect_calls(root: Node<'_>, source: &[u8]) -> Vec<CallSite> {
+fn collect_calls(
+    root: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+) -> (Vec<CallSite>, Vec<CallCandidate>) {
     let mut calls = Vec::new();
+    let mut call_candidates = Vec::new();
     let mut context_stack: Vec<String> = Vec::new();
-    walk_for_calls(root, source, &mut context_stack, &mut calls);
-    calls
+    walk_for_calls(
+        root,
+        source,
+        file_path,
+        &mut context_stack,
+        &mut calls,
+        &mut call_candidates,
+    );
+    (calls, call_candidates)
 }
 
 fn walk_for_calls(
     node: Node<'_>,
     source: &[u8],
+    file_path: &str,
     context_stack: &mut Vec<String>,
     calls: &mut Vec<CallSite>,
+    call_candidates: &mut Vec<CallCandidate>,
 ) {
     let node_kind = node.kind();
     let entered_context = extract_context_name(node, source);
@@ -242,19 +523,37 @@ fn walk_for_calls(
             .chars()
             .take(120)
             .collect::<String>();
-
+        let callee_name = extract_call_name(node, source).or_else(|| extract_name_from_snippet(&callee_snippet));
+        let caller_context = context_stack.last().cloned();
         calls.push(CallSite {
-            caller_context: context_stack.last().cloned(),
+            caller_context: caller_context.clone(),
+            callee_name: callee_name.clone(),
             callee_snippet,
             kind: node_kind.to_string(),
             location: point_to_position(node.start_position()),
         });
+        if let Some(callee_name) = callee_name {
+            call_candidates.push(CallCandidate {
+                caller_context,
+                callee_name,
+                kind: node_kind.to_string(),
+                file_path: file_path.to_string(),
+                location: point_to_position(node.start_position()),
+            });
+        }
     }
 
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            walk_for_calls(cursor.node(), source, context_stack, calls);
+            walk_for_calls(
+                cursor.node(),
+                source,
+                file_path,
+                context_stack,
+                calls,
+                call_candidates,
+            );
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -263,6 +562,202 @@ fn walk_for_calls(
 
     if entered_context.is_some() {
         context_stack.pop();
+    }
+}
+
+fn collect_symbols_and_dependencies(
+    root: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    language: LanguageKind,
+) -> (Vec<Symbol>, Vec<String>) {
+    let mut symbols = Vec::new();
+    let mut dependencies = Vec::new();
+    let mut scope_stack: Vec<String> = Vec::new();
+
+    walk_semantic(
+        root,
+        source,
+        file_path,
+        language,
+        &mut scope_stack,
+        &mut symbols,
+        &mut dependencies,
+    );
+
+    dependencies.sort();
+    dependencies.dedup();
+    (symbols, dependencies)
+}
+
+fn walk_semantic(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    language: LanguageKind,
+    scope_stack: &mut Vec<String>,
+    symbols: &mut Vec<Symbol>,
+    dependencies: &mut Vec<String>,
+) {
+    let kind = node.kind();
+    if matches!(kind, "import_declaration" | "using_directive" | "package_declaration") {
+        if let Ok(text) = node.utf8_text(source) {
+            let dep = text.trim().replace('\n', " ");
+            if !dep.is_empty() {
+                dependencies.push(dep);
+            }
+        }
+    }
+
+    let declared = detect_decl_symbol(node, source, language, file_path, scope_stack);
+    let mut pushed_scope = false;
+    if let Some(symbol) = declared {
+        let pushes_scope = matches!(
+            symbol.kind,
+            SymbolKind::Class | SymbolKind::Method | SymbolKind::Constructor
+        );
+        if pushes_scope {
+            scope_stack.push(symbol.name.clone());
+            pushed_scope = true;
+        }
+        symbols.push(symbol);
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            walk_semantic(
+                cursor.node(),
+                source,
+                file_path,
+                language,
+                scope_stack,
+                symbols,
+                dependencies,
+            );
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    if pushed_scope {
+        scope_stack.pop();
+    }
+}
+
+fn detect_decl_symbol(
+    node: Node<'_>,
+    source: &[u8],
+    language: LanguageKind,
+    file_path: &str,
+    scope_stack: &[String],
+) -> Option<Symbol> {
+    let (kind, name) = match node.kind() {
+        "class_declaration" => (SymbolKind::Class, extract_decl_name(node, source)?),
+        "method_declaration" | "local_function_statement" => {
+            (SymbolKind::Method, extract_decl_name(node, source)?)
+        }
+        "constructor_declaration" => (SymbolKind::Constructor, extract_decl_name(node, source)?),
+        "parameter" => (SymbolKind::Parameter, extract_decl_name(node, source)?),
+        "variable_declarator" => (SymbolKind::Variable, extract_decl_name(node, source)?),
+        _ => return None,
+    };
+
+    let scope = if scope_stack.is_empty() {
+        "global".to_string()
+    } else {
+        scope_stack.join("::")
+    };
+    let fq_name = if scope == "global" {
+        name.clone()
+    } else {
+        format!("{scope}::{name}")
+    };
+    let start = point_to_position(node.start_position());
+    let id = format!("{}::{:?}::{}:{}:{}", file_path, kind, name, start.row, start.column);
+    Some(Symbol {
+        id,
+        name,
+        fq_name,
+        kind,
+        language,
+        file_path: file_path.to_string(),
+        scope,
+        range: Range {
+            start,
+            end: point_to_position(node.end_position()),
+        },
+    })
+}
+
+fn extract_decl_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if let Ok(text) = name_node.utf8_text(source) {
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    first_identifier_text(node, source)
+}
+
+fn first_identifier_text(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() == "identifier" {
+        if let Ok(text) = node.utf8_text(source) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if let Some(found) = first_identifier_text(cursor.node(), source) {
+                return Some(found);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn extract_call_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        if let Ok(text) = name_node.utf8_text(source) {
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    first_identifier_text(node, source)
+}
+
+fn extract_name_from_snippet(snippet: &str) -> Option<String> {
+    let before_paren = snippet.split('(').next().unwrap_or(snippet);
+    let mut current = String::new();
+    let mut last_token = String::new();
+    for ch in before_paren.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            last_token = current.clone();
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        last_token = current;
+    }
+    if last_token.is_empty() {
+        None
+    } else {
+        Some(last_token)
     }
 }
 

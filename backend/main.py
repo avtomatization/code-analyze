@@ -31,8 +31,17 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 def ensure_rust_binary() -> None:
+    def latest_source_mtime() -> float:
+        candidates = [RUST_ANALYZER_DIR / "Cargo.toml", RUST_ANALYZER_DIR / "Cargo.lock"]
+        src_dir = RUST_ANALYZER_DIR / "src"
+        if src_dir.exists():
+            candidates.extend(p for p in src_dir.rglob("*.rs"))
+        mtimes = [p.stat().st_mtime for p in candidates if p.exists()]
+        return max(mtimes) if mtimes else 0.0
+
     if RUST_BINARY_PATH.exists():
-        return
+        if RUST_BINARY_PATH.stat().st_mtime >= latest_source_mtime():
+            return
 
     build_cmd = ["cargo", "build", "--release"]
     build_env = os.environ.copy()
